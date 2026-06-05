@@ -1,0 +1,40 @@
+simulation:
+  tick_duration_seconds: 0.5
+  election_interval_ticks: 30
+
+world:
+  initial_population: 20
+  initial_resources:
+    food: 50
+    wood: 100
+    stone: 50
+    gold: 200
+
+llm:
+  default_provider: ollama
+  default_model: llama3.1:8b
+  ollama_base_url: http://localhost:11434
+  openai_base_url: https://api.openai.com/v1
+  openai_api_key: ""
+
+memory:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  vector_store: sqlite-vss
+  embedding_dim: 384
+  max_retrieval: 10
+
+economy:
+  food_per_agent: 1
+  scarcity_enabled: true
+  farmer_production: 2
+  woodcutter_production: 3
+  consumption_per_agent: 3
+
+langfuse:
+  enabled: false
+  public_key: ""
+  secret_key: ""
+  host: https://cloud.langfuse.com
+
+database:
+  path: data/village.db

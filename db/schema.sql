@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS actions (
     tick INTEGER NOT NULL,
     agent_id TEXT NOT NULL,
     type TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'unknown',
     target TEXT,
     payload TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (agent_id) REFERENCES agents(id)
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS llm_traces (
     tick INTEGER NOT NULL,
     prompt TEXT NOT NULL,
     response TEXT NOT NULL,
+    thinking TEXT NOT NULL DEFAULT '',
     latency_ms REAL,
     token_usage INTEGER,
     action_type TEXT,

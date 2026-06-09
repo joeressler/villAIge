@@ -1,3 +1,13 @@
+import { useState } from "react";
+
+interface Trace {
+  tick: number;
+  action_type: string;
+  latency_ms: number;
+  thinking?: string;
+  response?: string;
+}
+
 interface Props {
   agents: Array<{ id: string; name: string; role: string; stats: Record<string, number> }>;
   selectedId: string | null;
@@ -5,15 +15,17 @@ interface Props {
     agent?: Record<string, unknown>;
     relationships?: Array<Record<string, number | string>>;
     memories?: Array<{ tick: number; text: string; importance: number; emotion: string }>;
-    traces?: Array<{ tick: number; action_type: string; latency_ms: number }>;
+    traces?: Trace[];
   } | null;
   onSelect: (id: string) => void;
 }
 
 export default function AgentInspector({ agents, selectedId, detail, onSelect }: Props) {
+  const [expandedTrace, setExpandedTrace] = useState<number | null>(null);
   const agent = detail?.agent as Record<string, unknown> | undefined;
   const personality = agent?.personality as Record<string, number> | undefined;
   const stats = agent?.stats as Record<string, number> | undefined;
+  const traces = detail?.traces ?? [];
 
   return (
     <div className="inspector">
@@ -83,6 +95,51 @@ export default function AgentInspector({ agents, selectedId, detail, onSelect }:
               ))}
             </ul>
           </div>
+
+          <div className="section">
+            <strong>Decision Traces ({traces.length})</strong>
+            <div className="traces">
+              {traces.length === 0 && (
+                <p className="trace-empty">No decision traces yet.</p>
+              )}
+              {traces.slice(0, 10).map((t, i) => {
+                const isOpen = expandedTrace === i;
+                const hasThinking = Boolean(t.thinking?.trim());
+                return (
+                  <div key={i} className="trace">
+                    <button
+                      className="trace-header"
+                      onClick={() => setExpandedTrace(isOpen ? null : i)}
+                    >
+                      <span className="trace-tick">T{t.tick}</span>
+                      <span className="trace-action">{t.action_type || "—"}</span>
+                      <span className="trace-latency">
+                        {t.latency_ms != null ? `${Math.round(t.latency_ms)}ms` : "—"}
+                      </span>
+                      {hasThinking && <span className="trace-badge">reasoning</span>}
+                      <span className="trace-chevron">{isOpen ? "▾" : "▸"}</span>
+                    </button>
+                    {isOpen && (
+                      <div className="trace-body">
+                        {hasThinking && (
+                          <div className="trace-thinking">
+                            <span className="trace-label">Thinking</span>
+                            <pre>{t.thinking}</pre>
+                          </div>
+                        )}
+                        {t.response && (
+                          <div className="trace-response">
+                            <span className="trace-label">Response</span>
+                            <pre>{t.response.length > 400 ? `${t.response.slice(0, 400)}…` : t.response}</pre>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
       )}
 
@@ -119,6 +176,55 @@ export default function AgentInspector({ agents, selectedId, detail, onSelect }:
         .emotion { font-size: 0.65rem; text-transform: uppercase; }
         .emotion.fear, .emotion.anger { color: var(--accent2); }
         .emotion.joy, .emotion.hope { color: var(--accent); }
+        .traces { display: flex; flex-direction: column; gap: 0.25rem; }
+        .trace-empty { font-size: 0.75rem; color: var(--muted); margin: 0; }
+        .trace { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+        .trace-header {
+          display: grid;
+          grid-template-columns: 2.5rem 1fr 3.5rem auto 1rem;
+          gap: 0.35rem;
+          align-items: center;
+          width: 100%;
+          padding: 0.35rem 0.5rem;
+          font-size: 0.75rem;
+          background: transparent;
+          border: none;
+          text-align: left;
+          cursor: pointer;
+        }
+        .trace-header:hover { background: rgba(255,255,255,0.03); }
+        .trace-tick { color: var(--muted); font-family: monospace; }
+        .trace-action { font-weight: 600; text-transform: uppercase; font-size: 0.7rem; }
+        .trace-latency { color: var(--muted); font-size: 0.65rem; text-align: right; }
+        .trace-badge {
+          font-size: 0.6rem;
+          text-transform: uppercase;
+          color: var(--accent);
+          background: rgba(100,180,255,0.1);
+          padding: 0.1rem 0.35rem;
+          border-radius: 3px;
+        }
+        .trace-chevron { color: var(--muted); text-align: center; }
+        .trace-body { padding: 0.5rem; border-top: 1px solid var(--border); background: rgba(0,0,0,0.15); }
+        .trace-label {
+          display: block;
+          font-size: 0.65rem;
+          text-transform: uppercase;
+          color: var(--muted);
+          margin-bottom: 0.25rem;
+        }
+        .trace-thinking, .trace-response { margin-bottom: 0.5rem; }
+        .trace-thinking pre, .trace-response pre {
+          margin: 0;
+          font-size: 0.7rem;
+          font-family: monospace;
+          white-space: pre-wrap;
+          word-break: break-word;
+          color: var(--muted);
+          max-height: 120px;
+          overflow-y: auto;
+        }
+        .trace-thinking pre { color: #9ab; }
       `}</style>
     </div>
   );

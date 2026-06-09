@@ -11,3 +11,6 @@ frontend/dist/
 .DS_Store
 .pytest_cache/
 .mypy_cache/
+skills-lock.json
+.cursor/
+.agents/

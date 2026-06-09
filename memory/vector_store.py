@@ -1,83 +1,149 @@
 from __future__ import annotations
 
-import sqlite3
+import logging
 import struct
-from typing import Optional
+from typing import Any, Optional
 
-import numpy as np
+import chromadb
+from chromadb.api import ClientAPI
+from chromadb.config import Settings
 
+from config import MemoryConfig
 from db.repository import Repository
+from exceptions import VectorStoreError
 from memory.embedding import EmbeddingProvider
+from models.schemas import MemoryEvent
+
+logger = logging.getLogger(__name__)
 
 
 def _blob_from_vector(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def _vector_from_blob(blob: bytes) -> np.ndarray:
-    count = len(blob) // 4
-    return np.array(struct.unpack(f"{count}f", blob), dtype=np.float32)
-
-
 class VectorStore:
-    """SQLite-VSS wrapper with numpy cosine fallback."""
+    """ChromaDB-backed semantic memory search."""
 
-    def __init__(self, repo: Repository, embedding: EmbeddingProvider):
+    def __init__(
+        self,
+        repo: Repository,
+        embedding: EmbeddingProvider,
+        config: MemoryConfig,
+        chroma_client: ClientAPI | None = None,
+    ):
         self.repo = repo
         self.embedding = embedding
-        self._vss_available = False
-        self._init_vss()
-
-    def _init_vss(self) -> None:
-        try:
-            self.repo.conn.enable_load_extension(True)
-            for ext in ("sqlite-vss", "vss0", "/usr/local/lib/sqlite-vss"):
-                try:
-                    self.repo.conn.load_extension(ext)
-                    self._vss_available = True
-                    break
-                except sqlite3.OperationalError:
-                    continue
-            if self._vss_available:
-                dim = self.embedding.dimension
-                self.repo.conn.execute(
-                    f"""CREATE VIRTUAL TABLE IF NOT EXISTS memories_vss
-                        USING vss0(embedding({dim}))"""
+        self._collection_name = config.chroma_collection
+        self._expected_dim = config.embedding_dim
+        if chroma_client is not None:
+            self._client = chroma_client
+        else:
+            try:
+                self._client = chromadb.HttpClient(
+                    host=config.chroma_host,
+                    port=config.chroma_port,
+                    settings=Settings(anonymized_telemetry=False),
                 )
-                self.repo.conn.commit()
-        except Exception:
-            self._vss_available = False
+                self._client.heartbeat()
+            except Exception as e:
+                logger.exception(
+                    "Failed to connect to ChromaDB host=%s port=%s",
+                    config.chroma_host,
+                    config.chroma_port,
+                )
+                raise VectorStoreError(
+                    "Could not connect to ChromaDB at "
+                    f"{config.chroma_host}:{config.chroma_port}: {e}"
+                ) from e
+        self._ensure_collection()
 
-    def insert(self, memory_id: str, text: str) -> bytes:
+    def _ensure_collection(self) -> None:
+        try:
+            self._collection = self._client.get_or_create_collection(
+                name=self._collection_name,
+            )
+        except Exception as e:
+            logger.exception("Failed to initialize Chroma collection")
+            raise VectorStoreError(
+                f"Failed to initialize Chroma collection {self._collection_name!r}: {e}"
+            ) from e
+
+    def clear(self) -> None:
+        try:
+            self._client.delete_collection(self._collection_name)
+        except Exception:
+            pass
+        self._ensure_collection()
+
+    def _stored_embedding_dim(self) -> int | None:
+        if self._collection.count() == 0:
+            return None
+        result = self._collection.get(limit=1, include=["embeddings"])
+        embeddings = result.get("embeddings")
+        if embeddings is None or len(embeddings) == 0:
+            return None
+        first = embeddings[0]
+        if first is None or len(first) == 0:
+            return None
+        return len(first)
+
+    def _is_dimension_mismatch_error(self, error: Exception) -> bool:
+        return "dimension" in str(error).lower()
+
+    def _recreate_on_dimension_mismatch(self, reason: str) -> None:
+        logger.warning(
+            "Chroma collection %r incompatible with embedding_dim=%s (%s); "
+            "recreating collection — run simulation Reset to re-index SQLite memories",
+            self._collection_name,
+            self._expected_dim,
+            reason,
+        )
+        self.clear()
+
+    def ensure_compatible_dimension(self) -> None:
+        stored_dim = self._stored_embedding_dim()
+        if stored_dim is not None and stored_dim != self._expected_dim:
+            self._recreate_on_dimension_mismatch(
+                f"stored vectors are {stored_dim}-dimensional"
+            )
+            return
+        if self._collection.count() == 0:
+            return
+        try:
+            probe = self.embedding.embed("dimension probe")
+            self._collection.query(query_embeddings=[probe], n_results=1)
+        except Exception as e:
+            if self._is_dimension_mismatch_error(e):
+                self._recreate_on_dimension_mismatch(str(e))
+                return
+            raise VectorStoreError(f"Chroma dimension probe failed: {e}") from e
+
+    def insert(self, memory: MemoryEvent, text: str) -> bytes:
         vec = self.embedding.embed(text)
         blob = _blob_from_vector(vec)
-        if self._vss_available:
-            try:
-                rowid = self._get_rowid(memory_id)
-                if rowid is not None:
-                    self.repo.conn.execute(
-                        "DELETE FROM memories_vss WHERE rowid = ?", (rowid,)
-                    )
-                self.repo.conn.execute(
-                    "INSERT INTO memories_vss(rowid, embedding) VALUES (?, ?)",
-                    (self._memory_rowid(memory_id), blob),
-                )
-                self.repo.conn.commit()
-            except sqlite3.Error:
-                pass
+        try:
+            self._collection.upsert(
+                ids=[memory.id],
+                embeddings=[vec],
+                documents=[text],
+                metadatas=[
+                    {
+                        "agent_id": memory.agent_id,
+                        "tick": int(memory.tick),
+                        "importance": float(memory.importance),
+                        "emotion": memory.emotion,
+                    }
+                ],
+            )
+        except Exception as e:
+            if self._is_dimension_mismatch_error(e):
+                self._recreate_on_dimension_mismatch(str(e))
+                return self.insert(memory, text)
+            logger.exception("Chroma upsert failed memory_id=%s", memory.id)
+            raise VectorStoreError(
+                f"Chroma insert failed for memory {memory.id!r}: {e}"
+            ) from e
         return blob
-
-    def _memory_rowid(self, memory_id: str) -> int:
-        row = self.repo.conn.execute(
-            "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
-        ).fetchone()
-        return row[0] if row else abs(hash(memory_id)) % (10**9)
-
-    def _get_rowid(self, memory_id: str) -> Optional[int]:
-        row = self.repo.conn.execute(
-            "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
-        ).fetchone()
-        return row[0] if row else None
 
     def search(
         self,
@@ -86,85 +152,66 @@ class VectorStore:
         limit: int = 10,
         current_tick: int = 0,
     ) -> list[dict]:
-        query_vec = np.array(self.embedding.embed(query), dtype=np.float32)
-
-        if self._vss_available:
-            results = self._vss_search(query_vec, agent_id, limit * 3)
-            if results:
-                return self._rerank(results, current_tick, limit)
-
-        return self._fallback_search(query_vec, agent_id, current_tick, limit)
-
-    def _vss_search(
-        self, query_vec: np.ndarray, agent_id: Optional[str], limit: int
-    ) -> list[dict]:
-        try:
-            blob = _blob_from_vector(query_vec.tolist())
-            rows = self.repo.conn.execute(
-                """SELECT m.id, m.agent_id, m.tick, m.text, m.importance, m.emotion,
-                          v.distance
-                   FROM memories_vss v
-                   JOIN memories m ON m.rowid = v.rowid
-                   WHERE vss_search(v.embedding, vss_search_params(?, 20))
-                   ORDER BY distance
-                   LIMIT ?""",
-                (blob, limit),
-            ).fetchall()
-            results = []
-            for r in rows:
-                if agent_id and r["agent_id"] != agent_id:
-                    continue
-                results.append(
-                    {
-                        "id": r["id"],
-                        "agent_id": r["agent_id"],
-                        "tick": r["tick"],
-                        "text": r["text"],
-                        "importance": r["importance"],
-                        "emotion": r["emotion"],
-                        "similarity": 1.0 - r["distance"],
-                    }
-                )
-            return results
-        except sqlite3.Error:
+        if limit <= 0:
+            return []
+        if self._collection.count() == 0:
             return []
 
-    def _fallback_search(
-        self,
-        query_vec: np.ndarray,
-        agent_id: Optional[str],
-        current_tick: int,
-        limit: int,
-    ) -> list[dict]:
-        if agent_id:
-            rows = self.repo.conn.execute(
-                "SELECT id, agent_id, tick, text, importance, emotion, embedding FROM memories WHERE agent_id = ?",
-                (agent_id,),
-            ).fetchall()
-        else:
-            rows = self.repo.conn.execute(
-                "SELECT id, agent_id, tick, text, importance, emotion, embedding FROM memories"
-            ).fetchall()
+        query_vec = self.embedding.embed(query)
+        where: Optional[dict[str, Any]] = (
+            {"agent_id": agent_id} if agent_id else None
+        )
+        n_results = min(limit * 3, self._collection.count())
+        try:
+            response = self._collection.query(
+                query_embeddings=[query_vec],
+                n_results=n_results,
+                where=where,
+                include=["metadatas", "distances", "documents"],
+            )
+        except Exception as e:
+            if self._is_dimension_mismatch_error(e):
+                self._recreate_on_dimension_mismatch(str(e))
+                return []
+            logger.exception("Chroma search failed agent_id=%s", agent_id)
+            raise VectorStoreError(f"Chroma search failed: {e}") from e
 
-        scored = []
-        for r in rows:
-            if r["embedding"] is None:
+        results: list[dict] = []
+        ids = response.get("ids", [[]])[0]
+        distances = response.get("distances", [[]])[0]
+        metadatas = response.get("metadatas", [[]])[0]
+        documents = response.get("documents", [[]])[0]
+        for memory_id, distance, meta, document in zip(
+            ids, distances, metadatas, documents
+        ):
+            if meta:
+                results.append(
+                    {
+                        "id": memory_id,
+                        "agent_id": meta["agent_id"],
+                        "tick": int(meta["tick"]),
+                        "text": document or "",
+                        "importance": float(meta["importance"]),
+                        "emotion": meta["emotion"],
+                        "similarity": max(0.0, 1.0 - float(distance)),
+                    }
+                )
                 continue
-            vec = _vector_from_blob(r["embedding"])
-            sim = float(np.dot(query_vec, vec) / (np.linalg.norm(vec) + 1e-8))
-            scored.append(
+            row = self.repo.get_memory_by_id(memory_id)
+            if not row:
+                continue
+            results.append(
                 {
-                    "id": r["id"],
-                    "agent_id": r["agent_id"],
-                    "tick": r["tick"],
-                    "text": r["text"],
-                    "importance": r["importance"],
-                    "emotion": r["emotion"],
-                    "similarity": sim,
+                    "id": row.id,
+                    "agent_id": row.agent_id,
+                    "tick": row.tick,
+                    "text": row.text,
+                    "importance": row.importance,
+                    "emotion": row.emotion,
+                    "similarity": max(0.0, 1.0 - float(distance)),
                 }
             )
-        scored.sort(key=lambda x: x["similarity"], reverse=True)
-        return self._rerank(scored[: limit * 3], current_tick, limit)
+        return self._rerank(results, current_tick, limit)
 
     def _rerank(self, results: list[dict], current_tick: int, limit: int) -> list[dict]:
         emotion_weights = {

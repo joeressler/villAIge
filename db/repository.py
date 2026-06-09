@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from models.schemas import (
+    normalize_agent_stats,
+    ACTION_CATEGORIES,
     Action,
     Agent,
     AgentGoals,
@@ -15,6 +17,7 @@ from models.schemas import (
     MemoryEvent,
     Relationship,
     WorldState,
+    get_action_category,
 )
 
 
@@ -33,19 +36,81 @@ class Repository:
         return self._conn
 
     def initialize(self) -> None:
+        # Legacy DBs may lack new columns; migrate before schema indexes run.
+        self._migrate_schema()
         schema_path = Path(__file__).parent / "schema.sql"
-        with schema_path.open() as f:
-            self.conn.executescript(f.read())
+        schema_sql = schema_path.read_text()
+        try:
+            self.conn.executescript(schema_sql)
+        except sqlite3.OperationalError as exc:
+            if "category" not in str(exc):
+                raise
+            self._migrate_schema()
+            self.conn.executescript(schema_sql)
+        self._migrate_schema()
         self.conn.commit()
+
+    def _migrate_schema(self) -> None:
+        if not self._table_exists("actions"):
+            return
+
+        action_cols = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(actions)").fetchall()
+        }
+        if "category" not in action_cols:
+            self.conn.execute(
+                "ALTER TABLE actions ADD COLUMN category TEXT NOT NULL DEFAULT 'unknown'"
+            )
+            for action_type, category in ACTION_CATEGORIES.items():
+                self.conn.execute(
+                    "UPDATE actions SET category = ? WHERE type = ?",
+                    (category, action_type),
+                )
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_actions_category ON actions(category)"
+        )
+
+        if self._table_exists("llm_traces"):
+            trace_cols = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(llm_traces)").fetchall()
+            }
+            if "thinking" not in trace_cols:
+                self.conn.execute(
+                    "ALTER TABLE llm_traces ADD COLUMN thinking TEXT NOT NULL DEFAULT ''"
+                )
+
+    def _table_exists(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
 
     def close(self) -> None:
         if self._conn:
             self._conn.close()
             self._conn = None
 
+    def clear_simulation_data(self) -> None:
+        for table in (
+            "memories",
+            "actions",
+            "llm_traces",
+            "relationships",
+            "world_events",
+            "tick_snapshots",
+            "world_state",
+            "agents",
+        ):
+            self.conn.execute(f"DELETE FROM {table}")
+        self.conn.commit()
+
     # --- Agents ---
 
     def save_agent(self, agent: Agent) -> None:
+        normalize_agent_stats(agent)
         self.conn.execute(
             """INSERT OR REPLACE INTO agents
                (id, name, role, wealth, reputation, influence,
@@ -85,9 +150,9 @@ class Repository:
             name=row["name"],
             role=row["role"],
             stats=AgentStats(
-                wealth=row["wealth"],
-                reputation=row["reputation"],
-                influence=row["influence"],
+                wealth=round(row["wealth"]) if row["wealth"] is not None else 0,
+                reputation=round(row["reputation"]) if row["reputation"] is not None else 0,
+                influence=round(row["influence"]) if row["influence"] is not None else 0,
             ),
             personality=AgentPersonality(
                 greed=row["greed"],
@@ -225,10 +290,18 @@ class Repository:
     # --- Actions ---
 
     def save_action(self, tick: int, agent_id: str, action: Action) -> int:
+        category = action.category
         cursor = self.conn.execute(
-            """INSERT INTO actions (tick, agent_id, type, target, payload)
-               VALUES (?, ?, ?, ?, ?)""",
-            (tick, agent_id, action.type, action.target, json.dumps(action.payload)),
+            """INSERT INTO actions (tick, agent_id, type, category, target, payload)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                tick,
+                agent_id,
+                action.type,
+                category,
+                action.target,
+                json.dumps(action.payload),
+            ),
         )
         self.conn.commit()
         return cursor.lastrowid or 0
@@ -238,17 +311,22 @@ class Repository:
             "SELECT * FROM actions WHERE tick = ? ORDER BY id",
             (tick,),
         ).fetchall()
-        return [
-            {
-                "id": r["id"],
-                "tick": r["tick"],
-                "agent_id": r["agent_id"],
-                "type": r["type"],
-                "target": r["target"],
-                "payload": json.loads(r["payload"]),
-            }
-            for r in rows
-        ]
+        return [self._row_to_action_log(r) for r in rows]
+
+    def _row_to_action_log(self, row: sqlite3.Row) -> dict[str, Any]:
+        action_type = row["type"]
+        category = row["category"] if "category" in row.keys() else get_action_category(
+            action_type
+        )
+        return {
+            "id": row["id"],
+            "tick": row["tick"],
+            "agent_id": row["agent_id"],
+            "type": action_type,
+            "category": category,
+            "target": row["target"],
+            "payload": json.loads(row["payload"]),
+        }
 
     # --- World State ---
 
@@ -328,13 +406,24 @@ class Repository:
         latency_ms: float = 0.0,
         token_usage: int = 0,
         action_type: str = "",
+        thinking: str = "",
     ) -> str:
         trace_id = str(uuid.uuid4())
         self.conn.execute(
             """INSERT INTO llm_traces
-               (id, agent_id, tick, prompt, response, latency_ms, token_usage, action_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (trace_id, agent_id, tick, prompt, response, latency_ms, token_usage, action_type),
+               (id, agent_id, tick, prompt, response, thinking, latency_ms, token_usage, action_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                trace_id,
+                agent_id,
+                tick,
+                prompt,
+                response,
+                thinking,
+                latency_ms,
+                token_usage,
+                action_type,
+            ),
         )
         self.conn.commit()
         return trace_id

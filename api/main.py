@@ -7,13 +7,18 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 from api.websocket import manager, websocket_endpoint
 from config import load_config
+from models.schemas import ACTION_CATEGORIES
+from observability.logging_config import configure_logging
+from observability.feed import feed
+from observability.langfuse_metrics import get_metrics_dashboard
+from observability.tick_profiler import get_profiler
+from simulation_core.standing import standings_for_agents
 from simulation_core.tick_engine import TickEngine
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 config = load_config()
@@ -47,6 +52,7 @@ async def lifespan(app: FastAPI):
             await _pump_task
         except asyncio.CancelledError:
             pass
+    engine.tracer.flush()
     engine.repo.close()
 
 
@@ -66,10 +72,6 @@ app.add_middleware(
 )
 
 
-class LLMConfigRequest(BaseModel):
-    enabled: bool = False
-
-
 @app.post("/simulation/start")
 async def start_simulation():
     _ensure_initialized()
@@ -81,6 +83,20 @@ async def start_simulation():
 async def stop_simulation():
     await engine.stop()
     return {"status": "stopped", "tick": engine.state.tick}
+
+
+@app.post("/simulation/reset")
+async def reset_simulation():
+    global _initialized
+    state = await engine.reset()
+    feed.clear()
+    _initialized = True
+    return {
+        "status": "reset",
+        "tick": state.tick,
+        "population": state.population,
+        "resources": state.resources.model_dump(),
+    }
 
 
 @app.post("/simulation/step")
@@ -98,14 +114,28 @@ async def get_state():
     chief_name = None
     if state.chief and state.chief in engine.agents:
         chief_name = engine.agents[state.chief].name
+    standings = standings_for_agents(engine.agents, config.election)
+    ballot_tally = engine.elections.ballot_tally(state)
+    candidate_names = {
+        cid: engine.agents[cid].name
+        for cid in state.election_state.candidates
+        if cid in engine.agents
+    }
+    agents_with_standing = [
+        {**a, "standing": round(standings.get(a["id"], 0.0), 3)}
+        for a in agents
+    ]
     return {
         "tick": state.tick,
         "population": state.population,
         "chief": state.chief,
         "chief_name": chief_name,
         "resources": state.resources.model_dump(),
+        "threat": state.threat.model_dump(),
         "election_state": state.election_state.model_dump(),
-        "agents": agents,
+        "election_candidate_names": candidate_names,
+        "election_ballot_tally": ballot_tally,
+        "agents": agents_with_standing,
         "running": engine._running,
     }
 
@@ -131,6 +161,14 @@ async def get_events(limit: int = 50):
     return engine.repo.get_world_events(limit=limit)
 
 
+@app.get("/actions/types")
+async def get_action_types():
+    return {
+        action_type: {"category": category}
+        for action_type, category in ACTION_CATEGORIES.items()
+    }
+
+
 @app.get("/relationships")
 async def get_relationships():
     rels = engine.repo.get_all_relationships()
@@ -145,10 +183,28 @@ async def get_relationships():
     ]
 
 
-@app.post("/simulation/llm")
-async def configure_llm(req: LLMConfigRequest):
-    engine.set_use_llm(req.enabled)
-    return {"llm_enabled": req.enabled}
+@app.get("/observability/errors")
+async def get_error_feed(limit: int = 100):
+    return feed.get_errors(limit=limit)
+
+
+@app.get("/observability/logs")
+async def get_log_feed(limit: int = 100, min_level: str = "INFO"):
+    return feed.get_logs(limit=limit, min_level=min_level)
+
+
+@app.get("/observability/metrics/dashboard")
+async def get_langfuse_metrics_dashboard(hours: int = 24):
+    return get_metrics_dashboard(config.langfuse, hours=hours)
+
+
+@app.get("/observability/profile")
+async def get_tick_profile(limit: int = 10):
+    profiler = get_profiler()
+    return {
+        "summary": profiler.get_summary(limit=limit),
+        "recent_ticks": profiler.get_recent(limit=limit),
+    }
 
 
 @app.websocket("/ws/live")

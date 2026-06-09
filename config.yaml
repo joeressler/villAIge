@@ -1,40 +1,85 @@
 simulation:
   tick_duration_seconds: 0.5
   election_interval_ticks: 30
+  profile_ticks: true
 
 world:
-  initial_population: 20
+  initial_population: 10
   initial_resources:
-    food: 50
+    food: 30
     wood: 100
     stone: 50
     gold: 200
 
 llm:
   default_provider: ollama
-  default_model: llama3.1:8b
+  default_model: qwen3.5:2b
   ollama_base_url: http://localhost:11434
   openai_base_url: https://api.openai.com/v1
   openai_api_key: ""
+  reasoning_enabled: false
+  ollama_think: false
+  temperature: 0.7
+  openai_reasoning_effort: low
+  store_reasoning_memory: false
+  reasoning_memory_importance: 0.75
+  request_timeout_seconds: 120
+  reasoning_request_timeout_seconds: 300
+  action_aliases:
+    resource: trade
+    resources: trade
+  max_decision_attempts: 3
 
 memory:
-  embedding_model: sentence-transformers/all-MiniLM-L6-v2
-  vector_store: sqlite-vss
-  embedding_dim: 384
+  embedding_provider: ollama
+  embedding_model: nomic-embed-text-v2-moe
+  vector_store: chromadb
+  embedding_dim: 768
   max_retrieval: 10
+  chroma_host: localhost
+  chroma_port: 8100
+  chroma_collection: village_memories
+
+election:
+  standing_wealth_weight: 0.5
+  standing_reputation_weight: 0.5
+  candidate_count: 5
+  wildcard_slots: 1
+  chief_cooldown_terms: 1
+  max_campaign_rep_per_tick: 1
+  max_campaign_rep_per_election: 3
+  winner_rep_bonus: 5
+  chief_bonus_rep: 5
+  chief_bonus_influence: 10
+  rep_decay_rate: 0.02
+  abstain_fallback: weighted
 
 economy:
   food_per_agent: 1
   scarcity_enabled: true
   farmer_production: 2
   woodcutter_production: 3
-  consumption_per_agent: 3
+  consumption_per_agent: 1
+  trader_conversion_rate: 2
+  trader_gold_cost: 5
+  guard_mitigation_factor: 0.5
+  threat_food_stable_days: 5.0
+  threat_food_strained_days: 2.0
+  threat_food_critical_days: 1.0
+  threat_wood_stable: 20
+  threat_wood_strained: 10
+  threat_wood_critical: 5
+  threat_gold_stable: 50
+  threat_gold_strained: 25
+  threat_gold_critical: 10
 
 langfuse:
-  enabled: false
+  # Overridden by LANGFUSE_ENABLED, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL in .env
+  enabled: true
   public_key: ""
   secret_key: ""
-  host: https://cloud.langfuse.com
+  base_url: http://localhost:3000
+  host: http://localhost:3000
 
 database:
   path: data/village.db

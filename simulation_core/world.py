@@ -8,6 +8,7 @@ from config import AppConfig
 from db.repository import Repository
 from models.schemas import (
     FIRST_NAMES,
+    PRIMARY_GOALS,
     ROLE_DISTRIBUTION,
     Agent,
     AgentGoals,
@@ -16,6 +17,7 @@ from models.schemas import (
     ElectionState,
     Relationship,
     Resources,
+    ThreatState,
     WorldState,
 )
 
@@ -34,13 +36,22 @@ class World:
             self.state = existing
             self.agents = {a.id: a for a in self.repo.get_all_agents()}
             return self.state
+        return self._create_fresh_world()
 
+    def reset(self) -> WorldState:
+        self.agents.clear()
+        self.repo.clear_simulation_data()
+        return self._create_fresh_world()
+
+    def _create_fresh_world(self) -> WorldState:
         res = self.config.world.initial_resources
         self.state = WorldState(
             tick=0,
             population=self.config.world.initial_population,
             resources=Resources(**res),
             chief=None,
+            chief_history=[],
+            threat=ThreatState(),
             election_state=ElectionState(),
         )
         self._spawn_agents()
@@ -54,8 +65,16 @@ class World:
         )
         roles = self._assign_roles(self.config.world.initial_population)
 
+        chief_count = max(1, int(self.config.world.initial_population * 0.3))
+
         for i in range(self.config.world.initial_population):
             name = names[i % len(names)]
+            if i < chief_count:
+                primary = "become_chief"
+                secondary_pool = [g for g in PRIMARY_GOALS if g != primary]
+            else:
+                primary = random.choice([g for g in PRIMARY_GOALS if g != "become_chief"])
+                secondary_pool = [g for g in PRIMARY_GOALS if g != primary]
             agent = Agent(
                 id=str(uuid.uuid4())[:8],
                 name=name,
@@ -72,10 +91,10 @@ class World:
                     honesty=round(random.uniform(0.1, 0.9), 2),
                 ),
                 goals=AgentGoals(
-                    primary="become_chief",
+                    primary=primary,
                     secondary=random.sample(
-                        ["accumulate_wealth", "build_alliances", "help_community"],
-                        k=random.randint(1, 2),
+                        secondary_pool,
+                        k=min(random.randint(1, 2), len(secondary_pool)),
                     ),
                 ),
             )
@@ -113,8 +132,12 @@ class World:
 
     def set_chief(self, agent_id: str) -> None:
         self.state.chief = agent_id
+        history = list(self.state.chief_history)
+        history.append(agent_id)
+        self.state.chief_history = history[-10:]
         agent = self.agents.get(agent_id)
         if agent:
-            agent.stats.influence += 20
-            agent.stats.reputation += 10
+            cfg = self.config.election
+            agent.stats.influence += cfg.chief_bonus_influence
+            agent.stats.reputation += cfg.chief_bonus_rep
             self.update_agent(agent)

@@ -1,94 +1,207 @@
 from __future__ import annotations
 
 import json
-import random
-from typing import Any, Optional
+import logging
+import re
 
-from models.schemas import VALID_ACTIONS, Action, Agent, WorldState
+from agents.action_normalize import NormalizedAction, normalize_action
+from exceptions import InvalidActionError, LLMParseError
+from models.schemas import Action, Agent
 
+logger = logging.getLogger(__name__)
 
-class HeuristicAgent:
-    """Fallback decision maker when LLM is unavailable."""
+_TARGET_BARE_RE = re.compile(
+    r'("target"\s*:\s*)([A-Za-z0-9_-]+)(\s*[,}])',
+    re.IGNORECASE,
+)
 
-    def decide(self, agent: Agent, world: WorldState, context: dict[str, Any]) -> Action:
-        relationships = context.get("relationships", [])
-        candidates = context.get("election_candidates", [])
-        other_agents = context.get("other_agents", [])
-
-        if world.election_state.active and candidates:
-            if agent.id in candidates:
-                return Action(type="campaign", payload={"message": f"{agent.name} for chief!"})
-            if candidates:
-                best = self._pick_vote_target(agent, candidates, relationships)
-                return Action(type="vote", target=best)
-
-        roll = random.random()
-        if roll < 0.2 and other_agents:
-            target = random.choice(other_agents)["id"]
-            return Action(
-                type="trade",
-                target=target,
-                payload={"resource": "food", "amount": 1, "price": 3},
-            )
-        if roll < 0.35 and other_agents:
-            target = random.choice(other_agents)["id"]
-            return Action(type="talk", target=target, payload={"topic": "village affairs"})
-        if roll < 0.45 and agent.personality.greed > 0.6 and other_agents:
-            target = random.choice(other_agents)["id"]
-            return Action(type="steal", target=target, payload={"amount": 2})
-        if roll < 0.55 and agent.personality.sociability > 0.5 and other_agents:
-            target = random.choice(other_agents)["id"]
-            return Action(type="gift", target=target, payload={"amount": 1})
-        if roll < 0.65:
-            return Action(type="build", payload={"structure": "shed"})
-        if roll < 0.75 and other_agents:
-            target = random.choice(other_agents)["id"]
-            return Action(type="persuade", target=target, payload={"topic": "support me"})
-        if other_agents:
-            target = random.choice(other_agents)["id"]
-            return Action(type="talk", target=target, payload={"topic": "greetings"})
-        return Action(type="build", payload={"structure": "fence"})
-
-    def _pick_vote_target(
-        self, agent: Agent, candidates: list[str], relationships: list[dict]
-    ) -> str:
-        best_id = candidates[0]
-        best_score = -1.0
-        rel_map = {}
-        for r in relationships:
-            other = r["b_id"] if r["a_id"] == agent.id else r["a_id"]
-            rel_map[other] = r
-        for cid in candidates:
-            rel = rel_map.get(cid, {})
-            score = rel.get("trust", 0.3) * 0.5 + rel.get("respect", 0.3) * 0.3
-            if cid == agent.id:
-                score += 0.2
-            if score > best_score:
-                best_score = score
-                best_id = cid
-        return best_id
+_THINKING_BLOCK_PATTERNS = (
+    re.compile(r".*?", re.DOTALL | re.IGNORECASE),
+    re.compile(
+        r"<\s*redacted_thinking\s*>.*?<\s*/\s*redacted_thinking\s*>",
+        re.DOTALL | re.IGNORECASE,
+    ),
+    re.compile(
+        r"<\s*think(?:ing)?\s*>.*?<\s*/\s*think(?:ing)?\s*>",
+        re.DOTALL | re.IGNORECASE,
+    ),
+)
 
 
 class AgentRunner:
-    def __init__(self, heuristic: Optional[HeuristicAgent] = None):
-        self.heuristic = heuristic or HeuristicAgent()
+    def __init__(self, aliases: dict[str, str] | None = None) -> None:
+        self.aliases = aliases
 
-    def validate_action(self, action: Action) -> Action:
-        if action.type not in VALID_ACTIONS:
-            return Action(type="talk", payload={"topic": "idle"})
-        return action
+    def normalize(
+        self,
+        data: dict,
+        *,
+        agents: list[Agent] | None = None,
+        valid_agent_ids: frozenset[str] | None = None,
+        acting_agent_id: str | None = None,
+    ) -> NormalizedAction:
+        return normalize_action(
+            data,
+            agents=agents,
+            valid_agent_ids=valid_agent_ids,
+            aliases=self.aliases,
+            acting_agent_id=acting_agent_id,
+        )
 
-    def parse_llm_action(self, response: str) -> Action:
-        try:
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                data = json.loads(response[start:end])
-                return Action(
-                    type=data.get("type", "talk"),
-                    target=data.get("target"),
-                    payload=data.get("payload", {}),
-                )
-        except (json.JSONDecodeError, KeyError):
-            pass
-        return Action(type="talk", payload={"topic": "uncertain"})
+    def validate_action(
+        self,
+        action: Action,
+        valid_agent_ids: frozenset[str] | None = None,
+        agents: list[Agent] | None = None,
+        acting_agent_id: str | None = None,
+    ) -> Action:
+        return self.normalize(
+            action.model_dump(),
+            agents=agents,
+            valid_agent_ids=valid_agent_ids,
+            acting_agent_id=acting_agent_id,
+        ).action
+
+    @staticmethod
+    def extract_inline_thinking(response: str) -> str:
+        parts: list[str] = []
+        for pattern in _THINKING_BLOCK_PATTERNS:
+            for match in pattern.finditer(response):
+                block = match.group(0)
+                inner = re.sub(
+                    r"^<\s*[^>]+>\s*|\s*<\s*/\s*[^>]+>\s*$",
+                    "",
+                    block,
+                    flags=re.IGNORECASE | re.DOTALL,
+                ).strip()
+                if inner:
+                    parts.append(inner)
+        return "\n".join(parts).strip()
+
+    @staticmethod
+    def _strip_reasoning(response: str) -> str:
+        text = response
+        for pattern in _THINKING_BLOCK_PATTERNS:
+            text = pattern.sub("", text)
+        return text.strip()
+
+    @staticmethod
+    def _repair_llm_json(text: str) -> str:
+        def quote_bare_target(match: re.Match[str]) -> str:
+            prefix, value, suffix = match.groups()
+            if value.lower() in {"null", "true", "false"}:
+                return match.group(0)
+            try:
+                float(value)
+                return match.group(0)
+            except ValueError:
+                return f'{prefix}"{value}"{suffix}'
+
+        return _TARGET_BARE_RE.sub(quote_bare_target, text)
+
+    @staticmethod
+    def _loads_action_json(snippet: str) -> dict | None:
+        for candidate in (snippet, AgentRunner._repair_llm_json(snippet)):
+            try:
+                obj = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+        return None
+
+    @staticmethod
+    def _parse_action_loose(text: str) -> dict | None:
+        type_match = re.search(r'"type"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+        if not type_match:
+            return None
+        result: dict = {"type": type_match.group(1)}
+        target_match = re.search(
+            r'"target"\s*:\s*(?:"([^"]*)"|null|([A-Za-z0-9_-]+))',
+            text,
+            re.IGNORECASE,
+        )
+        if target_match:
+            quoted, bare = target_match.groups()
+            value = quoted if quoted is not None else bare
+            if value and value.lower() not in {"null", "none"}:
+                result["target"] = value
+            else:
+                result["target"] = None
+        payload_match = re.search(r'"payload"\s*:\s*(\{[^}]*\})', text)
+        if payload_match:
+            payload = AgentRunner._loads_action_json(payload_match.group(1))
+            if payload is not None:
+                result["payload"] = payload
+            else:
+                result["payload"] = {}
+        else:
+            result["payload"] = {}
+        return result
+
+    @staticmethod
+    def _extract_json_objects(text: str) -> list[dict]:
+        objects: list[dict] = []
+        i = 0
+        while i < len(text):
+            start = text.find("{", i)
+            if start < 0:
+                break
+            depth = 0
+            in_string = False
+            escape = False
+            parsed: dict | None = None
+            for j in range(start, len(text)):
+                ch = text[j]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        parsed = AgentRunner._loads_action_json(text[start : j + 1])
+                        break
+            if parsed is not None:
+                objects.append(parsed)
+                i = start + 1
+            else:
+                i = start + 1
+        return objects
+
+    @classmethod
+    def _select_action_payload(cls, response: str) -> dict | None:
+        cleaned = cls._strip_reasoning(response)
+        for source in (cleaned, response):
+            candidates = cls._extract_json_objects(source)
+            typed = [obj for obj in candidates if obj.get("type")]
+            if typed:
+                return typed[-1]
+            loose = cls._parse_action_loose(source)
+            if loose:
+                return loose
+            substantive = [obj for obj in candidates if obj]
+            if substantive:
+                return substantive[-1]
+        return None
+
+    def action_from_dict(self, data: dict) -> Action:
+        return self.normalize(data).action
+
+    def parse_llm_action(self, response: str, fallback_text: str = "") -> Action:
+        data = self._select_action_payload(response)
+        if data is None and fallback_text and fallback_text != response:
+            data = self._select_action_payload(fallback_text)
+        if data is None:
+            snippet = response[:200] if response else "(empty)"
+            logger.error("No JSON object found in LLM response snippet=%r", snippet)
+            raise LLMParseError(f"No JSON object found in LLM response: {snippet!r}")
+        return self.action_from_dict(data)

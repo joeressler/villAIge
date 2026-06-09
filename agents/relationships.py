@@ -29,7 +29,11 @@ class RelationshipManager:
         return Relationship(a_id=a_id, b_id=b_id)
 
     def update_from_action(self, agent_id: str, action: Action) -> None:
-        if not action.target or action.target == agent_id:
+        if (
+            not action.target
+            or action.target == agent_id
+            or not self.repo.get_agent(action.target)
+        ):
             return
         rel = self.get_relationship(agent_id, action.target)
         deltas = self.DELTAS.get(action.type, {})

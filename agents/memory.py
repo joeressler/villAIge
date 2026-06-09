@@ -35,7 +35,7 @@ class AgentMemory:
             importance=importance,
             emotion=emotion,
         )
-        blob = self.vector_store.insert(memory.id, text)
+        blob = self.vector_store.insert(memory, text)
         self.repo.save_memory(memory, embedding=blob)
         return memory
 

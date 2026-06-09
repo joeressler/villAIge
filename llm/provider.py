@@ -8,8 +8,12 @@ from typing import Any
 @dataclass
 class LLMResponse:
     text: str
+    thinking: str = ""
     latency_ms: float = 0.0
     token_usage: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
     model: str = ""
 
 

@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Emergent Village Simulation",
-    description="Multi-agent village simulation with SQLite + LangGraph",
+    description="Multi-agent village simulation with SQLite + DeepAgent SDK",
     version="1.0.0",
     lifespan=lifespan,
 )

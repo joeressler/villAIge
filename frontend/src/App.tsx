@@ -217,7 +217,7 @@ export default function App() {
     <div className="app">
       <header>
         <h1>🏘️ Emergent Village Simulation</h1>
-        <p className="subtitle">SQLite + LangGraph multi-agent society</p>
+        <p className="subtitle">SQLite + DeepAgent multi-agent society</p>
       </header>
 
       <Dashboard

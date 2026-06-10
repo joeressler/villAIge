@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from typing import Any, Callable, Optional
 
@@ -52,6 +53,7 @@ class TickEngine:
             tracer=self.tracer,
             agent_runner=self.agent_runner,
             config=config,
+            economy=self.economy,
         )
         self.resolver = ActionResolver(
             self.repo, self.economy, self.relationships, self.memory, self.elections, self.tracer
@@ -169,6 +171,7 @@ class TickEngine:
 
         agents_this_tick = list(self.world.agents.values())
         total_agents = len(agents_this_tick)
+        self.resolver.begin_tick()
         self._emit({
             "type": "tick_started",
             "tick": tick,
@@ -191,8 +194,9 @@ class TickEngine:
                 })
                 with self.profiler.agent_phase(agent.id, "agent_total"):
                     with self.profiler.agent_phase(agent.id, "decision"):
+                        ctx = contextvars.copy_context()
                         action = await asyncio.to_thread(
-                            self.decision_graph.run, agent, state
+                            ctx.run, self.decision_graph.run, agent, state
                         )
                     with self.profiler.agent_phase(agent.id, "resolve"):
                         description = self.resolver.resolve(
@@ -247,6 +251,9 @@ class TickEngine:
                 self.repo.save_agent(agent)
             self.repo.save_world_state(state)
             self.repo.save_tick_snapshot(state)
+            self.repo.save_relationship_snapshots(
+                tick, self.repo.get_all_relationships()
+            )
         self.world.state = state
 
         ballot_tally = self.elections.ballot_tally(state)
@@ -295,12 +302,29 @@ class TickEngine:
         agent = self.world.get_agent(agent_id)
         if not agent:
             return None
+        relationships = []
+        for relationship in self.relationships.repo.get_relationships_for_agent(agent_id):
+            other_id = (
+                relationship.b_id
+                if relationship.a_id == agent_id
+                else relationship.a_id
+            )
+            other = self.world.get_agent(other_id)
+            relationships.append(
+                {
+                    **relationship.model_dump(),
+                    "other_id": other_id,
+                    "other_name": other.name if other else other_id,
+                    "other_role": other.role if other else "",
+                }
+            )
+        relationships.sort(
+            key=lambda row: (row["friendship"], row["trust"]),
+            reverse=True,
+        )
         return {
             "agent": agent.model_dump(),
-            "relationships": [
-                r.model_dump()
-                for r in self.relationships.repo.get_relationships_for_agent(agent_id)
-            ],
+            "relationships": relationships,
             "memories": [
                 m.model_dump()
                 for m in self.memory.get_recent(agent_id, limit=20)

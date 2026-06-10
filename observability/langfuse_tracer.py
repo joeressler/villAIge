@@ -7,11 +7,30 @@ from typing import Any, Callable, Generator, Optional
 
 from config import LangfuseConfig
 from db.repository import Repository
-from llm.provider import LLMResponse
+from llm.provider import LLMResponse, LLMResponsePath
 from models.schemas import Agent, WorldState
 from observability.feed import feed
 
 logger = logging.getLogger(__name__)
+
+
+def estimate_token_cost_usd(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    reasoning_tokens: int,
+    input_cost_per_million: float,
+    output_cost_per_million: float,
+) -> dict[str, float]:
+    input_cost = prompt_tokens * input_cost_per_million / 1_000_000
+    output_tokens = completion_tokens + reasoning_tokens
+    output_cost = output_tokens * output_cost_per_million / 1_000_000
+    details: dict[str, float] = {}
+    if input_cost > 0:
+        details["input"] = round(input_cost, 8)
+    if output_cost > 0:
+        details["output"] = round(output_cost, 8)
+    return details
 
 
 class LangfuseTracer:
@@ -112,7 +131,7 @@ class LangfuseTracer:
             )
             return graph_invoke(None)
 
-        session_id = f"tick-{world.tick}"
+        session_id = f"simulation-tick-{world.tick}"
         tags = ["village-sim", "agent-decision", agent.role]
         if world.election_state.active:
             tags.append("election-active")
@@ -128,7 +147,6 @@ class LangfuseTracer:
             },
         ) as decision_span:
             with propagate_attributes(
-                trace_name="agent-decision",
                 session_id=session_id,
                 user_id=agent.id,
                 tags=tags,
@@ -147,6 +165,7 @@ class LangfuseTracer:
                         "action_type": action.get("type"),
                         "action_category": action.get("category"),
                         "target": action.get("target"),
+                        "response_path": result.get("response_path", "freeform"),
                     }
                 )
                 return result
@@ -164,6 +183,8 @@ class LangfuseTracer:
         action_type: str,
         action_category: str,
         action_target: Optional[str],
+        response_path: LLMResponsePath = "freeform",
+        attempt: int = 1,
     ) -> str:
         trace_id = self.repo.save_llm_trace(
             agent_id=agent_id,
@@ -174,35 +195,70 @@ class LangfuseTracer:
             latency_ms=response.latency_ms,
             token_usage=response.token_usage,
             action_type=action_type,
+            response_path=response_path,
+        )
+        logger.info(
+            "LLM decision agent_id=%s tick=%s path=%s attempt=%s action=%s latency_ms=%.0f",
+            agent_id,
+            tick,
+            response_path,
+            attempt,
+            action_type,
+            response.latency_ms,
+        )
+        feed.record_log(
+            level="INFO",
+            logger="agents.decision_graph",
+            message=(
+                f"tick={tick} agent={agent_id} path={response_path} "
+                f"attempt={attempt} action={action_type}"
+            ),
         )
         if not self.enabled:
             return trace_id
 
+        generation_name = {
+            "structured": "llm-decision-structured",
+            "structured_fallback": "llm-decision-fallback",
+            "freeform": "llm-decision",
+        }.get(response_path, "llm-decision")
+
+        cost_details = self._cost_details(response)
+        metadata = self._metadata(
+            provider=provider,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            action_type=action_type,
+            action_category=action_category,
+            action_target=action_target or "-",
+            has_thinking=str(bool(thinking.strip())),
+            reasoning_tokens=response.reasoning_tokens,
+            response_path=response_path,
+            attempt=attempt,
+        )
+        if cost_details:
+            metadata["simulated_cost"] = "true"
+
         try:
             with self._client.start_as_current_observation(
                 as_type="generation",
-                name="llm-decision",
+                name=generation_name,
                 model=response.model or "unknown",
                 input={"prompt": prompt[:500]},
-                metadata=self._metadata(
-                    provider=provider,
-                    agent_id=agent_id,
-                    agent_name=agent_name,
-                    action_type=action_type,
-                    action_category=action_category,
-                    action_target=action_target or "-",
-                    has_thinking=str(bool(thinking.strip())),
-                    reasoning_tokens=response.reasoning_tokens,
-                ),
+                metadata=metadata,
             ) as generation:
-                generation.update(
-                    output={
+                update_kwargs: dict[str, Any] = {
+                    "output": {
                         "response": response.text[:500],
                         "action_type": action_type,
                         "action_category": action_category,
+                        "response_path": response_path,
                     },
-                    usage_details=self._usage_details(response),
-                )
+                    "usage_details": self._usage_details(response),
+                }
+                if cost_details:
+                    update_kwargs["cost_details"] = cost_details
+                generation.update(**update_kwargs)
                 if thinking.strip():
                     with self._client.start_as_current_observation(
                         as_type="generation",
@@ -221,6 +277,43 @@ class LangfuseTracer:
         except Exception:
             logger.exception("Langfuse LLM trace failed for agent %s", agent_id)
         return trace_id
+
+    def trace_structured_fallback(
+        self,
+        *,
+        agent_id: str,
+        tick: int,
+        message: str,
+    ) -> None:
+        logger.info(
+            "Structured output fallback agent_id=%s tick=%s message=%s",
+            agent_id,
+            tick,
+            message,
+        )
+        feed.record_log(
+            level="INFO",
+            logger="agents.decision_graph",
+            message=f"tick={tick} agent={agent_id} structured_fallback: {message}",
+        )
+        if not self.enabled:
+            return
+        try:
+            with self._client.start_as_current_observation(
+                as_type="span",
+                name="structured-output-fallback",
+                level="DEFAULT",
+                input={
+                    "agent_id": agent_id,
+                    "tick": tick,
+                    "message": message[:500],
+                },
+            ) as span:
+                span.update(output={"fallback": "freeform"})
+        except Exception:
+            logger.exception(
+                "Langfuse structured fallback trace failed for agent %s", agent_id
+            )
 
     def trace_decision_retry(
         self,
@@ -405,3 +498,20 @@ class LangfuseTracer:
         if response.token_usage > 0:
             details["total"] = response.token_usage
         return details
+
+    def _cost_details(self, response: LLMResponse) -> dict[str, float]:
+        if not self.config.simulate_cost:
+            return {}
+        if (
+            response.prompt_tokens <= 0
+            and response.completion_tokens <= 0
+            and response.reasoning_tokens <= 0
+        ):
+            return {}
+        return estimate_token_cost_usd(
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            reasoning_tokens=response.reasoning_tokens,
+            input_cost_per_million=self.config.input_cost_per_million_usd,
+            output_cost_per_million=self.config.output_cost_per_million_usd,
+        )

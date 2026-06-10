@@ -38,6 +38,7 @@ class LLMConfig(BaseModel):
     reasoning_request_timeout_seconds: float = 300.0
     action_aliases: dict[str, str] = Field(default_factory=dict)
     max_decision_attempts: int = 3
+    structured_output_enabled: bool = True
 
 
 class MemoryConfig(BaseModel):
@@ -52,8 +53,8 @@ class MemoryConfig(BaseModel):
 
 
 class ElectionConfig(BaseModel):
-    standing_wealth_weight: float = 0.5
-    standing_reputation_weight: float = 0.5
+    standing_wealth_weight: float = 0.45
+    standing_reputation_weight: float = 0.55
     candidate_count: int = 5
     wildcard_slots: int = 1
     chief_cooldown_terms: int = 1
@@ -66,14 +67,56 @@ class ElectionConfig(BaseModel):
     abstain_fallback: str = "weighted"
 
 
+class TradeResourceConfig(BaseModel):
+    seller_roles: list[str] = Field(default_factory=list)
+    default_amount: int = 1
+    default_price: int = 3
+
+
+def _default_trade_catalog() -> dict[str, TradeResourceConfig]:
+    return {
+        "food": TradeResourceConfig(
+            seller_roles=["farmer", "trader"], default_amount=1, default_price=3
+        ),
+        "wood": TradeResourceConfig(
+            seller_roles=["woodcutter", "trader"], default_amount=1, default_price=4
+        ),
+        "stone": TradeResourceConfig(
+            seller_roles=["builder", "trader"], default_amount=1, default_price=5
+        ),
+    }
+
+
 class EconomyConfig(BaseModel):
+    stewardship_mode: bool = True
     food_per_agent: int = 1
     scarcity_enabled: bool = True
-    farmer_production: int = 2
+    farmer_production: int = 3
+    farmer_max_food_sale_per_tick: int = 1
     woodcutter_production: int = 3
+    builder_quarry_wood_cost: int = 1
+    builder_quarry_stone_per_unit: int = 3
+    builder_quarry_max_per_action: int = 1
+    builder_stone_production: int = 2
     consumption_per_agent: int = 1
     trader_conversion_rate: int = 2
     trader_gold_cost: int = 5
+    gift_rep_gain: int = 1
+    gift_pair_cooldown_ticks: int = 8
+    gift_reciprocal_window_ticks: int = 5
+    gift_reciprocal_relationship_multiplier: float = 0.25
+    trade_catalog: dict[str, TradeResourceConfig] = Field(
+        default_factory=_default_trade_catalog
+    )
+    trade_buyer_rep: int = 1
+    trade_seller_rep: int = 1
+    trade_supply_credit_per_unit: int = 1
+    steal_rep_penalty_base: int = 2
+    steal_rep_penalty_if_liked_target: int = 4
+    steal_gold_cap: int = 3
+    sabotage_rep_penalty_base: int = 1
+    sabotage_rep_penalty_if_liked_target: int = 3
+    sabotage_max_amount: int = 2
     guard_mitigation_factor: float = 0.5
     threat_food_stable_days: float = 5.0
     threat_food_strained_days: float = 2.0
@@ -81,6 +124,9 @@ class EconomyConfig(BaseModel):
     threat_wood_stable: int = 20
     threat_wood_strained: int = 10
     threat_wood_critical: int = 5
+    threat_stone_stable: int = 10
+    threat_stone_strained: int = 5
+    threat_stone_critical: int = 2
     threat_gold_stable: int = 50
     threat_gold_strained: int = 25
     threat_gold_critical: int = 10
@@ -91,8 +137,10 @@ class LangfuseConfig(BaseModel):
 
     Loaded from config.yaml, then overridden by .env:
     LANGFUSE_ENABLED, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY,
-    LANGFUSE_BASE_URL (or LANGFUSE_HOST). API keys must match
-    LANGFUSE_INIT_PROJECT_* in .env; UI login uses LANGFUSE_INIT_USER_*.
+    LANGFUSE_BASE_URL (or LANGFUSE_HOST), LANGFUSE_SIMULATE_COST,
+    LANGFUSE_INPUT_COST_PER_MILLION_USD, LANGFUSE_OUTPUT_COST_PER_MILLION_USD.
+    API keys must match LANGFUSE_INIT_PROJECT_* in .env; UI login uses
+    LANGFUSE_INIT_USER_*.
     """
 
     enabled: bool = False
@@ -100,6 +148,9 @@ class LangfuseConfig(BaseModel):
     secret_key: str = ""
     base_url: str = ""
     host: str = ""
+    simulate_cost: bool = True
+    input_cost_per_million_usd: float = 1.50
+    output_cost_per_million_usd: float = 9.00
 
     @property
     def resolved_base_url(self) -> str:
@@ -140,6 +191,13 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
         config.langfuse.base_url = base_url
     elif host := os.environ.get("LANGFUSE_HOST"):
         config.langfuse.host = host
+    simulate_cost = _env_bool("LANGFUSE_SIMULATE_COST")
+    if simulate_cost is not None:
+        config.langfuse.simulate_cost = simulate_cost
+    if input_cost := os.environ.get("LANGFUSE_INPUT_COST_PER_MILLION_USD"):
+        config.langfuse.input_cost_per_million_usd = float(input_cost)
+    if output_cost := os.environ.get("LANGFUSE_OUTPUT_COST_PER_MILLION_USD"):
+        config.langfuse.output_cost_per_million_usd = float(output_cost)
     if db_path := os.environ.get("DATABASE_PATH"):
         config.database.path = db_path
     if ollama_url := os.environ.get("OLLAMA_BASE_URL"):

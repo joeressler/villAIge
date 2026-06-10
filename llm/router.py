@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from pydantic import BaseModel
+
 from config import LLMConfig
-from exceptions import ConfigurationError
+from exceptions import ConfigurationError, LLMParseError
 from llm.ollama import OllamaProvider
 from llm.openai import OpenAIProvider
-from llm.provider import LLMProvider, LLMResponse
+from llm.provider import LLMProvider, LLMResponse, StructuredLLMResult
 
 logger = logging.getLogger(__name__)
 
@@ -58,3 +60,21 @@ class LLMRouter:
     def generate(self, prompt: str, model_hint: Optional[str] = None, **kwargs: Any) -> LLMResponse:
         provider = self.get_provider(model_hint)
         return provider.generate(prompt, **self._generation_kwargs(**kwargs))
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[BaseModel],
+        model_hint: Optional[str] = None,
+        **kwargs: Any,
+    ) -> StructuredLLMResult:
+        provider = self.get_provider(model_hint)
+        try:
+            return provider.generate_structured(
+                prompt, schema, **self._generation_kwargs(**kwargs)
+            )
+        except LLMParseError:
+            raise
+        except Exception as e:
+            logger.exception("Structured output failed via provider=%s", provider.name)
+            raise LLMParseError(f"Structured output failed: {e}") from e

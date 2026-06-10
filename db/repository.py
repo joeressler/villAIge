@@ -51,6 +51,16 @@ class Repository:
         self.conn.commit()
 
     def _migrate_schema(self) -> None:
+        if self._table_exists("agents"):
+            agent_cols = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(agents)").fetchall()
+            }
+            if "supply_credit" not in agent_cols:
+                self.conn.execute(
+                    "ALTER TABLE agents ADD COLUMN supply_credit INTEGER NOT NULL DEFAULT 0"
+                )
+
         if not self._table_exists("actions"):
             return
 
@@ -80,6 +90,10 @@ class Repository:
                 self.conn.execute(
                     "ALTER TABLE llm_traces ADD COLUMN thinking TEXT NOT NULL DEFAULT ''"
                 )
+            if "response_path" not in trace_cols:
+                self.conn.execute(
+                    "ALTER TABLE llm_traces ADD COLUMN response_path TEXT NOT NULL DEFAULT 'freeform'"
+                )
 
     def _table_exists(self, name: str) -> bool:
         row = self.conn.execute(
@@ -98,6 +112,7 @@ class Repository:
             "memories",
             "actions",
             "llm_traces",
+            "relationship_snapshots",
             "relationships",
             "world_events",
             "tick_snapshots",
@@ -113,10 +128,10 @@ class Repository:
         normalize_agent_stats(agent)
         self.conn.execute(
             """INSERT OR REPLACE INTO agents
-               (id, name, role, wealth, reputation, influence,
+               (id, name, role, wealth, reputation, influence, supply_credit,
                 greed, sociability, aggression, honesty,
                 primary_goal, secondary_goals)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 agent.id,
                 agent.name,
@@ -124,6 +139,7 @@ class Repository:
                 agent.stats.wealth,
                 agent.stats.reputation,
                 agent.stats.influence,
+                agent.stats.supply_credit,
                 agent.personality.greed,
                 agent.personality.sociability,
                 agent.personality.aggression,
@@ -153,6 +169,11 @@ class Repository:
                 wealth=round(row["wealth"]) if row["wealth"] is not None else 0,
                 reputation=round(row["reputation"]) if row["reputation"] is not None else 0,
                 influence=round(row["influence"]) if row["influence"] is not None else 0,
+                supply_credit=(
+                    round(row["supply_credit"])
+                    if "supply_credit" in row.keys() and row["supply_credit"] is not None
+                    else 0
+                ),
             ),
             personality=AgentPersonality(
                 greed=row["greed"],
@@ -287,6 +308,46 @@ class Repository:
             for r in rows
         ]
 
+    def save_relationship_snapshots(
+        self, tick: int, relationships: list[Relationship]
+    ) -> None:
+        for rel in relationships:
+            a_id, b_id = sorted([rel.a_id, rel.b_id])
+            self.conn.execute(
+                """INSERT OR REPLACE INTO relationship_snapshots
+                   (tick, a_id, b_id, trust, respect, fear, friendship)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (tick, a_id, b_id, rel.trust, rel.respect, rel.fear, rel.friendship),
+            )
+        self.conn.commit()
+
+    def get_relationship_history(
+        self,
+        a_id: str,
+        b_id: str,
+        since_tick: int = 0,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        x, y = sorted([a_id, b_id])
+        rows = self.conn.execute(
+            """SELECT tick, trust, respect, fear, friendship
+               FROM relationship_snapshots
+               WHERE a_id = ? AND b_id = ? AND tick >= ?
+               ORDER BY tick ASC
+               LIMIT ?""",
+            (x, y, since_tick, limit),
+        ).fetchall()
+        return [
+            {
+                "tick": r["tick"],
+                "trust": r["trust"],
+                "respect": r["respect"],
+                "fear": r["fear"],
+                "friendship": r["friendship"],
+            }
+            for r in rows
+        ]
+
     # --- Actions ---
 
     def save_action(self, tick: int, agent_id: str, action: Action) -> int:
@@ -312,6 +373,26 @@ class Repository:
             (tick,),
         ).fetchall()
         return [self._row_to_action_log(r) for r in rows]
+
+    def get_gift_targets_since(self, agent_id: str, since_tick: int) -> list[str]:
+        rows = self.conn.execute(
+            """SELECT DISTINCT target FROM actions
+               WHERE agent_id = ? AND type = 'gift' AND target IS NOT NULL
+               AND tick > ?""",
+            (agent_id, since_tick),
+        ).fetchall()
+        return [row["target"] for row in rows]
+
+    def has_gift_between_since(
+        self, *, giver_id: str, receiver_id: str, since_tick: int
+    ) -> bool:
+        row = self.conn.execute(
+            """SELECT 1 FROM actions
+               WHERE agent_id = ? AND type = 'gift' AND target = ?
+               AND tick > ? LIMIT 1""",
+            (giver_id, receiver_id, since_tick),
+        ).fetchone()
+        return row is not None
 
     def _row_to_action_log(self, row: sqlite3.Row) -> dict[str, Any]:
         action_type = row["type"]
@@ -407,12 +488,14 @@ class Repository:
         token_usage: int = 0,
         action_type: str = "",
         thinking: str = "",
+        response_path: str = "freeform",
     ) -> str:
         trace_id = str(uuid.uuid4())
         self.conn.execute(
             """INSERT INTO llm_traces
-               (id, agent_id, tick, prompt, response, thinking, latency_ms, token_usage, action_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, agent_id, tick, prompt, response, thinking, response_path,
+                latency_ms, token_usage, action_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 trace_id,
                 agent_id,
@@ -420,6 +503,7 @@ class Repository:
                 prompt,
                 response,
                 thinking,
+                response_path,
                 latency_ms,
                 token_usage,
                 action_type,

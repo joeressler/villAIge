@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS agents (
     wealth INTEGER NOT NULL DEFAULT 10,
     reputation INTEGER NOT NULL DEFAULT 50,
     influence INTEGER NOT NULL DEFAULT 10,
+    supply_credit INTEGER NOT NULL DEFAULT 0,
     greed REAL NOT NULL DEFAULT 0.5,
     sociability REAL NOT NULL DEFAULT 0.5,
     aggression REAL NOT NULL DEFAULT 0.5,
@@ -40,6 +41,20 @@ CREATE TABLE IF NOT EXISTS relationships (
     FOREIGN KEY (b_id) REFERENCES agents(id)
 );
 
+CREATE TABLE IF NOT EXISTS relationship_snapshots (
+    tick INTEGER NOT NULL,
+    a_id TEXT NOT NULL,
+    b_id TEXT NOT NULL,
+    trust REAL NOT NULL,
+    respect REAL NOT NULL,
+    fear REAL NOT NULL,
+    friendship REAL NOT NULL,
+    PRIMARY KEY (tick, a_id, b_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rel_snapshots_pair
+    ON relationship_snapshots(a_id, b_id, tick);
+
 CREATE TABLE IF NOT EXISTS actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tick INTEGER NOT NULL,
@@ -52,6 +67,8 @@ CREATE TABLE IF NOT EXISTS actions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_actions_tick ON actions(tick);
+CREATE INDEX IF NOT EXISTS idx_actions_agent_type_target_tick
+    ON actions(agent_id, type, target, tick);
 
 CREATE TABLE IF NOT EXISTS world_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -81,6 +98,7 @@ CREATE TABLE IF NOT EXISTS llm_traces (
     prompt TEXT NOT NULL,
     response TEXT NOT NULL,
     thinking TEXT NOT NULL DEFAULT '',
+    response_path TEXT NOT NULL DEFAULT 'freeform',
     latency_ms REAL,
     token_usage INTEGER,
     action_type TEXT,

@@ -7,7 +7,19 @@ import {
   ResponsiveContainer,
   CartesianGrid,
   Cell,
+  Legend,
 } from "recharts";
+
+interface AgentStanding {
+  id: string;
+  name: string;
+  standing?: number;
+  wealth_rank?: number;
+  reputation_rank?: number;
+  standing_wealth_contrib?: number;
+  standing_reputation_contrib?: number;
+  stats: { wealth: number; reputation: number };
+}
 
 interface Props {
   tickProgress?: {
@@ -31,13 +43,9 @@ interface Props {
     };
     election_candidate_names?: Record<string, string>;
     election_ballot_tally?: Record<string, number>;
+    election_standing_weights?: { wealth: number; reputation: number };
     running: boolean;
-    agents: Array<{
-      id: string;
-      name: string;
-      standing?: number;
-      stats: { wealth: number; reputation: number };
-    }>;
+    agents: AgentStanding[];
   };
   onStart: () => void;
   onStop: () => void;
@@ -52,33 +60,110 @@ const THREAT_COLORS: Record<string, string> = {
   crisis: "#e74c3c",
 };
 
+const WEALTH_COLOR = "#feca57";
+const REPUTATION_COLOR = "#4ecdc4";
+
+function pct(value: number | undefined): number {
+  return Math.round((value ?? 0) * 100);
+}
+
+function selectLeadershipAgents(agents: AgentStanding[], candidateIds: string[]): AgentStanding[] {
+  const sorted = [...agents].sort((a, b) => (b.standing ?? 0) - (a.standing ?? 0));
+  const candidateSet = new Set(candidateIds);
+  const seen = new Set<string>();
+  const rows: AgentStanding[] = [];
+
+  for (const agent of sorted) {
+    if (candidateSet.has(agent.id) && !seen.has(agent.id)) {
+      rows.push(agent);
+      seen.add(agent.id);
+    }
+  }
+  for (const agent of sorted) {
+    if (rows.length >= 8) break;
+    if (!seen.has(agent.id)) {
+      rows.push(agent);
+      seen.add(agent.id);
+    }
+  }
+  return rows.sort((a, b) => (b.standing ?? 0) - (a.standing ?? 0));
+}
+
+function StandingTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: Array<{ payload: Record<string, unknown> }>;
+}) {
+  if (!active || !payload?.length) return null;
+  const row = payload[0].payload as {
+    name: string;
+    standingPct: number;
+    wealthRankPct: number;
+    repRankPct: number;
+    wealthScore: number;
+    repScore: number;
+    wealth: number;
+    reputation: number;
+    votes?: number;
+    isChief?: boolean;
+    isCandidate?: boolean;
+  };
+  return (
+    <div className="standing-tooltip">
+      <strong>{row.name}</strong>
+      {row.isChief && <span className="standing-badge chief">Chief</span>}
+      {row.isCandidate && <span className="standing-badge candidate">Candidate</span>}
+      <div className="standing-tooltip-line">
+        Election standing: <strong>{row.standingPct}%</strong>
+      </div>
+      <div className="standing-tooltip-line">
+        Wealth rank {row.wealthRankPct}% → +{row.wealthScore}% ({row.wealth} gold)
+      </div>
+      <div className="standing-tooltip-line">
+        Reputation rank {row.repRankPct}% → +{row.repScore}% ({row.reputation} rep)
+      </div>
+      {row.votes !== undefined && (
+        <div className="standing-tooltip-line">Ballots cast: {row.votes}</div>
+      )}
+    </div>
+  );
+}
+
 export default function Dashboard({ state, tickProgress, onStart, onStop, onStep, onReset }: Props) {
   const resourceData = Object.entries(state.resources || {}).map(([name, value]) => ({
     name,
     value,
   }));
 
-  const leadershipData = (state.agents || [])
-    .sort((a, b) => (b.standing ?? 0) - (a.standing ?? 0))
-    .slice(0, 8)
-    .map((a) => ({
-      name: a.name,
-      standing: Math.round((a.standing ?? 0) * 100),
-      wealth: a.stats.wealth,
-      reputation: a.stats.reputation,
-      isChief: a.id === state.chief,
-      isCandidate: state.election_state?.candidates?.includes(a.id),
-    }));
+  const weights = state.election_standing_weights ?? { wealth: 0.5, reputation: 0.5 };
+  const wealthWeightPct = Math.round(weights.wealth * 100);
+  const repWeightPct = Math.round(weights.reputation * 100);
+  const candidateIds = state.election_state?.candidates ?? [];
+  const ballotTally = state.election_ballot_tally ?? {};
+
+  const leadershipData = selectLeadershipAgents(state.agents || [], candidateIds).map((agent) => ({
+    name: agent.name,
+    standingPct: pct(agent.standing),
+    wealthRankPct: pct(agent.wealth_rank),
+    repRankPct: pct(agent.reputation_rank),
+    wealthScore: pct(agent.standing_wealth_contrib),
+    repScore: pct(agent.standing_reputation_contrib),
+    wealth: agent.stats.wealth,
+    reputation: agent.stats.reputation,
+    votes: ballotTally[agent.id],
+    isChief: agent.id === state.chief,
+    isCandidate: candidateIds.includes(agent.id),
+  }));
 
   const threat = state.threat ?? { level: "stable", message: "Unknown", food_days_remaining: 0 };
   const threatColor = THREAT_COLORS[threat.level] ?? "#8b9cb3";
 
-  const tallyEntries = Object.entries(state.election_ballot_tally ?? {}).map(
-    ([candidateId, votes]) => ({
-      name: state.election_candidate_names?.[candidateId] ?? candidateId.slice(0, 6),
-      votes,
-    })
-  );
+  const tallyEntries = Object.entries(ballotTally).map(([candidateId, votes]) => ({
+    name: state.election_candidate_names?.[candidateId] ?? candidateId.slice(0, 6),
+    votes,
+  }));
 
   return (
     <div className="dashboard">
@@ -164,26 +249,69 @@ export default function Dashboard({ state, tickProgress, onStart, onStop, onStep
             </BarChart>
           </ResponsiveContainer>
         </div>
-        <div className="chart-card">
-          <h3>Leadership Standings (Top 8)</h3>
-          <ResponsiveContainer width="100%" height={200}>
+        <div className="chart-card leadership-card">
+          <h3>Election Standing</h3>
+          <p className="chart-caption">
+            Standing = {wealthWeightPct}% wealth rank + {repWeightPct}% reputation rank
+            (village percentiles). Picks top candidates, breaks ties, and weights abstainer
+            votes (60% standing + 40% trust).
+          </p>
+          <ResponsiveContainer width="100%" height={240}>
             <BarChart data={leadershipData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#2d3a4f" />
               <XAxis dataKey="name" stroke="#8b9cb3" tick={{ fontSize: 10 }} />
-              <YAxis stroke="#8b9cb3" />
-              <Tooltip
-                contentStyle={{ background: "#1a2332", border: "1px solid #2d3a4f" }}
+              <YAxis
+                stroke="#8b9cb3"
+                domain={[0, 100]}
+                tickFormatter={(value) => `${value}%`}
               />
-              <Bar dataKey="standing" name="Standing %" radius={[4, 4, 0, 0]}>
+              <Tooltip content={<StandingTooltip />} />
+              <Legend wrapperStyle={{ fontSize: "0.75rem" }} />
+              <Bar
+                dataKey="wealthScore"
+                name={`Wealth (${wealthWeightPct}%)`}
+                stackId="standing"
+                fill={WEALTH_COLOR}
+                radius={[0, 0, 0, 0]}
+              >
                 {leadershipData.map((entry) => (
                   <Cell
-                    key={entry.name}
-                    fill={entry.isChief ? "#feca57" : entry.isCandidate ? "#4ecdc4" : "#6c7a89"}
+                    key={`${entry.name}-wealth`}
+                    fill={entry.isChief ? "#e6b800" : entry.isCandidate ? "#d4a017" : WEALTH_COLOR}
+                    opacity={entry.isCandidate || entry.isChief ? 1 : 0.75}
+                  />
+                ))}
+              </Bar>
+              <Bar
+                dataKey="repScore"
+                name={`Reputation (${repWeightPct}%)`}
+                stackId="standing"
+                fill={REPUTATION_COLOR}
+                radius={[4, 4, 0, 0]}
+              >
+                {leadershipData.map((entry) => (
+                  <Cell
+                    key={`${entry.name}-rep`}
+                    fill={entry.isChief ? "#3dbdb5" : entry.isCandidate ? "#45a29e" : REPUTATION_COLOR}
+                    opacity={entry.isCandidate || entry.isChief ? 1 : 0.75}
                   />
                 ))}
               </Bar>
             </BarChart>
           </ResponsiveContainer>
+          <div className="standing-legend-row">
+            <span className="standing-legend-item">
+              <span className="dot chief" /> Chief
+            </span>
+            <span className="standing-legend-item">
+              <span className="dot candidate" /> Candidate
+            </span>
+            {state.election_state?.active && (
+              <span className="standing-legend-item muted">
+                Candidates always shown during elections
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -234,6 +362,51 @@ export default function Dashboard({ state, tickProgress, onStart, onStop, onStep
           padding: 1rem;
         }
         .chart-card h3 { font-size: 0.875rem; color: var(--muted); margin-bottom: 0.5rem; }
+        .chart-caption {
+          font-size: 0.72rem;
+          color: var(--muted);
+          line-height: 1.4;
+          margin: -0.25rem 0 0.75rem;
+        }
+        .standing-legend-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.75rem;
+          margin-top: 0.5rem;
+          font-size: 0.72rem;
+          color: var(--muted);
+        }
+        .standing-legend-item { display: inline-flex; align-items: center; gap: 0.35rem; }
+        .standing-legend-item .dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          display: inline-block;
+        }
+        .standing-legend-item .dot.chief { background: #feca57; }
+        .standing-legend-item .dot.candidate { background: #4ecdc4; }
+        .standing-legend-item.muted { opacity: 0.85; }
+        .standing-tooltip {
+          background: #1a2332;
+          border: 1px solid #2d3a4f;
+          border-radius: 6px;
+          padding: 0.6rem 0.75rem;
+          font-size: 0.75rem;
+          line-height: 1.45;
+          max-width: 260px;
+        }
+        .standing-tooltip strong { color: #e8eef5; }
+        .standing-tooltip-line { color: #8b9cb3; margin-top: 0.25rem; }
+        .standing-badge {
+          display: inline-block;
+          margin-left: 0.35rem;
+          padding: 0.05rem 0.35rem;
+          border-radius: 4px;
+          font-size: 0.65rem;
+          text-transform: uppercase;
+        }
+        .standing-badge.chief { background: rgba(254, 202, 87, 0.2); color: #feca57; }
+        .standing-badge.candidate { background: rgba(78, 205, 196, 0.2); color: #4ecdc4; }
         @media (max-width: 900px) {
           .stats-grid { grid-template-columns: repeat(2, 1fr); }
           .charts-row { grid-template-columns: 1fr; }

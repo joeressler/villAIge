@@ -196,7 +196,8 @@ llm:
 economy:
   scarcity_enabled: true
   consumption_per_agent: 3
-  farmer_production: 2
+  farmer_production: 3
+  farmer_max_food_sale_per_tick: 1
 ```
 
 ## API Endpoints

@@ -26,12 +26,17 @@ interface SimState {
   election_state: { active: boolean; candidates: string[]; days_remaining: number };
   election_ballot_tally?: Record<string, number>;
   election_candidate_names?: Record<string, string>;
+  election_standing_weights?: { wealth: number; reputation: number };
   running: boolean;
   agents: Array<{
     id: string;
     name: string;
     role: string;
     standing?: number;
+    wealth_rank?: number;
+    reputation_rank?: number;
+    standing_wealth_contrib?: number;
+    standing_reputation_contrib?: number;
     stats: { wealth: number; reputation: number };
   }>;
 }
@@ -250,6 +255,8 @@ export default function App() {
           <AgentInspector
             agents={state.agents}
             selectedId={selectedAgent}
+            chiefId={state.chief}
+            currentTick={state.tick}
             detail={agentDetail}
             onSelect={setSelectedAgent}
           />

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel
+
+LLMResponsePath = Literal["structured", "freeform", "structured_fallback"]
 
 
 @dataclass
@@ -17,9 +21,24 @@ class LLMResponse:
     model: str = ""
 
 
+@dataclass
+class StructuredLLMResult:
+    response: LLMResponse
+    parsed: BaseModel
+
+
 class LLMProvider(ABC):
     @abstractmethod
     def generate(self, prompt: str, **kwargs: Any) -> LLMResponse:
+        pass
+
+    @abstractmethod
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[BaseModel],
+        **kwargs: Any,
+    ) -> StructuredLLMResult:
         pass
 
     @property

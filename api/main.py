@@ -15,7 +15,7 @@ from observability.logging_config import configure_logging
 from observability.feed import feed
 from observability.langfuse_metrics import get_metrics_dashboard
 from observability.tick_profiler import get_profiler
-from simulation_core.standing import standings_for_agents
+from simulation_core.standing import standing_details_for_agents
 from simulation_core.tick_engine import TickEngine
 
 configure_logging()
@@ -114,17 +114,31 @@ async def get_state():
     chief_name = None
     if state.chief and state.chief in engine.agents:
         chief_name = engine.agents[state.chief].name
-    standings = standings_for_agents(engine.agents, config.election)
+    standings = standing_details_for_agents(engine.agents, config.election)
     ballot_tally = engine.elections.ballot_tally(state)
     candidate_names = {
         cid: engine.agents[cid].name
         for cid in state.election_state.candidates
         if cid in engine.agents
     }
-    agents_with_standing = [
-        {**a, "standing": round(standings.get(a["id"], 0.0), 3)}
-        for a in agents
-    ]
+    wealth_weight = config.election.standing_wealth_weight
+    rep_weight = config.election.standing_reputation_weight
+    agents_with_standing = []
+    for agent in agents:
+        detail = standings.get(agent["id"], {})
+        standing = float(detail.get("standing", 0.0))
+        wealth_rank = float(detail.get("wealth_rank", 0.0))
+        rep_rank = float(detail.get("reputation_rank", 0.0))
+        agents_with_standing.append(
+            {
+                **agent,
+                "standing": standing,
+                "wealth_rank": wealth_rank,
+                "reputation_rank": rep_rank,
+                "standing_wealth_contrib": round(wealth_weight * wealth_rank, 3),
+                "standing_reputation_contrib": round(rep_weight * rep_rank, 3),
+            }
+        )
     return {
         "tick": state.tick,
         "population": state.population,
@@ -135,6 +149,10 @@ async def get_state():
         "election_state": state.election_state.model_dump(),
         "election_candidate_names": candidate_names,
         "election_ballot_tally": ballot_tally,
+        "election_standing_weights": {
+            "wealth": wealth_weight,
+            "reputation": rep_weight,
+        },
         "agents": agents_with_standing,
         "running": engine._running,
     }
@@ -146,6 +164,31 @@ async def get_agent(agent_id: str):
     if not detail:
         raise HTTPException(status_code=404, detail="Agent not found")
     return detail
+
+
+@app.get("/agent/{agent_id}/relationships/history")
+async def get_relationship_history(
+    agent_id: str,
+    other_id: str,
+    since_tick: int = 0,
+    limit: int = 500,
+):
+    if not engine.repo.get_agent(agent_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    other = engine.repo.get_agent(other_id)
+    if not other:
+        raise HTTPException(status_code=404, detail="Other agent not found")
+    series = engine.repo.get_relationship_history(
+        agent_id, other_id, since_tick=since_tick, limit=limit
+    )
+    if not series:
+        raise HTTPException(status_code=404, detail="No relationship history found")
+    return {
+        "agent_id": agent_id,
+        "other_id": other_id,
+        "other_name": other.name,
+        "series": series,
+    }
 
 
 @app.get("/tick/{tick_id}")

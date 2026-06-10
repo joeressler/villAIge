@@ -29,6 +29,7 @@ llm:
     resource: trade
     resources: trade
   max_decision_attempts: 3
+  structured_output_enabled: true
 
 memory:
   embedding_provider: ollama
@@ -41,8 +42,8 @@ memory:
   chroma_collection: village_memories
 
 election:
-  standing_wealth_weight: 0.5
-  standing_reputation_weight: 0.5
+  standing_wealth_weight: 0.45
+  standing_reputation_weight: 0.55
   candidate_count: 5
   wildcard_slots: 1
   chief_cooldown_terms: 1
@@ -55,13 +56,45 @@ election:
   abstain_fallback: weighted
 
 economy:
+  stewardship_mode: true
   food_per_agent: 1
   scarcity_enabled: true
-  farmer_production: 2
+  farmer_production: 3
+  farmer_max_food_sale_per_tick: 1
   woodcutter_production: 3
+  builder_quarry_wood_cost: 1
+  builder_quarry_stone_per_unit: 3
+  builder_quarry_max_per_action: 1
+  builder_stone_production: 2
   consumption_per_agent: 1
   trader_conversion_rate: 2
   trader_gold_cost: 5
+  gift_rep_gain: 1
+  gift_pair_cooldown_ticks: 8
+  gift_reciprocal_window_ticks: 5
+  gift_reciprocal_relationship_multiplier: 0.25
+  trade_catalog:
+    food:
+      seller_roles: [farmer, trader]
+      default_amount: 1
+      default_price: 3
+    wood:
+      seller_roles: [woodcutter, trader]
+      default_amount: 1
+      default_price: 4
+    stone:
+      seller_roles: [builder, trader]
+      default_amount: 1
+      default_price: 5
+  trade_buyer_rep: 1
+  trade_seller_rep: 1
+  trade_supply_credit_per_unit: 1
+  steal_rep_penalty_base: 2
+  steal_rep_penalty_if_liked_target: 4
+  steal_gold_cap: 3
+  sabotage_rep_penalty_base: 1
+  sabotage_rep_penalty_if_liked_target: 3
+  sabotage_max_amount: 2
   guard_mitigation_factor: 0.5
   threat_food_stable_days: 5.0
   threat_food_strained_days: 2.0
@@ -69,6 +102,9 @@ economy:
   threat_wood_stable: 20
   threat_wood_strained: 10
   threat_wood_critical: 5
+  threat_stone_stable: 10
+  threat_stone_strained: 5
+  threat_stone_critical: 2
   threat_gold_stable: 50
   threat_gold_strained: 25
   threat_gold_critical: 10
@@ -80,6 +116,10 @@ langfuse:
   secret_key: ""
   base_url: http://localhost:3000
   host: http://localhost:3000
+  # Simulated USD cost for local/Ollama models (ingested as Langfuse cost_details)
+  simulate_cost: true
+  input_cost_per_million_usd: 1.50
+  output_cost_per_million_usd: 9.00
 
 database:
   path: data/village.db

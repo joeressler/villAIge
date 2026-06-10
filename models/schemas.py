@@ -34,6 +34,7 @@ class ThreatState(BaseModel):
     level: str = "stable"
     food_days_remaining: float = 0.0
     wood_days_remaining: float = 0.0
+    stone_days_remaining: float = 0.0
     gold_days_remaining: float = 0.0
     message: str = "Village resources are stable."
 
@@ -71,8 +72,9 @@ class AgentStats(BaseModel):
     wealth: int = 10
     reputation: int = 50
     influence: int = 10
+    supply_credit: int = 0
 
-    @field_validator("wealth", "reputation", "influence", mode="before")
+    @field_validator("wealth", "reputation", "influence", "supply_credit", mode="before")
     @classmethod
     def _coerce_int_stats(cls, value: Any) -> Any:
         if isinstance(value, float):
@@ -84,6 +86,7 @@ class AgentStats(BaseModel):
             wealth=coerce_stat_int(self.wealth),
             reputation=coerce_stat_int(self.reputation),
             influence=coerce_stat_int(self.influence),
+            supply_credit=coerce_stat_int(self.supply_credit),
         )
 
 
@@ -127,11 +130,13 @@ ACTION_CATEGORIES: dict[str, str] = {
     "trade": "economic",
     "gift": "economic",
     "steal": "hostile",
+    "sabotage": "hostile",
     "talk": "social",
     "persuade": "social",
     "campaign": "political",
     "vote": "political",
     "build": "civic",
+    "quarry": "civic",
 }
 
 
@@ -168,8 +173,11 @@ ACTION_ALIASES: dict[str, str] = {
 
 
 def normalize_action_type(action_type: str) -> str:
+    from agents.action_vocab import resolve_action_type_alias
+
     cleaned = action_type.strip().lower()
-    return ACTION_ALIASES.get(cleaned, cleaned)
+    mapped = resolve_action_type_alias(cleaned)
+    return mapped if mapped is not None else cleaned
 
 ROLE_DISTRIBUTION = {
     "farmer": 0.4,

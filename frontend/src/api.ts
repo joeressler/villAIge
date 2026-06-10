@@ -45,6 +45,41 @@ export async function fetchRelationships() {
   return res.json();
 }
 
+export interface RelationshipHistoryPoint {
+  tick: number;
+  trust: number;
+  respect: number;
+  fear: number;
+  friendship: number;
+}
+
+export interface RelationshipHistoryResponse {
+  agent_id: string;
+  other_id: string;
+  other_name: string;
+  series: RelationshipHistoryPoint[];
+}
+
+export async function fetchRelationshipHistory(
+  agentId: string,
+  otherId: string,
+  sinceTick = 0,
+  limit = 500
+): Promise<RelationshipHistoryResponse> {
+  const params = new URLSearchParams({
+    other_id: otherId,
+    since_tick: String(sinceTick),
+    limit: String(limit),
+  });
+  const res = await fetch(
+    `${API_BASE}/agent/${agentId}/relationships/history?${params}`
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to fetch relationship history (${res.status})`);
+  }
+  return res.json();
+}
+
 export async function fetchErrors(limit = 100) {
   const res = await fetch(`${API_BASE}/observability/errors?limit=${limit}`);
   return res.json();
@@ -65,12 +100,22 @@ export interface MetricsDashboard {
     llm_calls: number;
     avg_latency_ms: number;
     total_tokens: number;
+    total_input_tokens: number;
+    total_output_tokens: number;
     total_cost_usd: number;
     decision_errors: number;
   };
   llm_volume: Array<{ hour: string; count: number }>;
-  latency_by_model: Array<{ model: string; p50_ms: number; p95_ms: number }>;
-  tokens_cost_by_model: Array<{ model: string; tokens: number; cost_usd: number }>;
+  latency_over_time: Array<{ hour: string; p50_ms: number; p95_ms: number }>;
+  tokens_cost_by_model: Array<{
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    tokens: number;
+    input_cost_usd: number;
+    output_cost_usd: number;
+    cost_usd: number;
+  }>;
   errors_over_time: Array<{ hour: string; count: number }>;
   activity_by_observation: Array<{ name: string; count: number }>;
   action_mix: Array<{ action_type: string; count: number; pct: number }>;

@@ -49,17 +49,22 @@ class AgentMemory:
         results = self.vector_store.search(
             query, agent_id=agent_id, limit=limit, current_tick=current_tick
         )
-        return [
-            MemoryEvent(
-                id=r["id"],
-                agent_id=r["agent_id"],
-                tick=r["tick"],
-                text=r["text"],
-                importance=r["importance"],
-                emotion=r["emotion"],
-            )
-            for r in results
-        ]
+        memories: list[MemoryEvent] = []
+        for search_hit in results:
+            try:
+                memories.append(MemoryEvent.model_validate(search_hit))
+            except Exception:
+                memories.append(
+                    MemoryEvent(
+                        id=search_hit["id"],
+                        agent_id=search_hit["agent_id"],
+                        tick=search_hit["tick"],
+                        text=search_hit["text"],
+                        importance=search_hit["importance"],
+                        emotion=search_hit["emotion"],
+                    )
+                )
+        return memories
 
     def get_recent(self, agent_id: str, limit: int = 20) -> list[MemoryEvent]:
         return self.repo.get_memories_for_agent(agent_id, limit=limit)

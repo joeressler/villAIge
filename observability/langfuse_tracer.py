@@ -34,7 +34,7 @@ def estimate_token_cost_usd(
 
 
 class LangfuseTracer:
-    """Langfuse v4 tracing for village simulation (LangGraph + custom LLM calls)."""
+    """Langfuse v4 tracing for village simulation (DeepAgent SDK + custom LLM calls)."""
 
     def __init__(self, config: LangfuseConfig, repo: Repository):
         self.config = config
@@ -127,7 +127,7 @@ class LangfuseTracer:
             from langfuse.langchain import CallbackHandler
         except ModuleNotFoundError:
             logger.warning(
-                "langchain not installed; LangGraph callback tracing disabled"
+                "langchain not installed; DeepAgent callback tracing disabled"
             )
             return graph_invoke(None)
 

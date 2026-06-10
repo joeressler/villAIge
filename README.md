@@ -9,7 +9,7 @@ For module-level architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - **Backend**: Python 3.11+, FastAPI, SQLite, asyncio, Pydantic
 - **Vector Memory**: ChromaDB (Docker Compose service or external server)
 - **Embeddings**: Provider-agnostic layer (Ollama, OpenAI-compatible) — default `nomic-embed-text-v2-moe` (768 dims)
-- **Agent Orchestration**: LangGraph decision pipeline per agent
+- **Agent Orchestration**: LangChain DeepAgent SDK decision agent per villager
 - **LLM**: Provider-agnostic layer (Ollama, OpenAI-compatible) — required for all agent decisions
 - **Observability**: Langfuse tracing + SQLite replay + in-app metrics and tick profiling
 - **Frontend**: React + Vite, D3.js relationship graph, Recharts
@@ -39,7 +39,7 @@ The embedding provider must be reachable at startup (Ollama `/api/embed` or Open
 
 ```
 simulation_core/   # World, tick engine, economy, elections, events
-agents/            # Agent model, LangGraph pipeline, memory, relationships
+agents/            # Agent model, DeepAgent decision pipeline, memory, relationships
 llm/               # Ollama, OpenAI providers + routers (LLM + embeddings)
 memory/            # Embedding contract + ChromaDB vector store client
 db/                # SQLite schema + repository
@@ -310,7 +310,7 @@ Values in `.env` override `config.yaml` at runtime (see `.env.example` for the f
 Each tick (1 simulated day):
 
 1. **World events** — storms, harvests, bandits, etc.
-2. **Per-agent decisions** — observe → relationships → structured memory → semantic memory (ChromaDB) → LangGraph LLM decision → validate action
+2. **Per-agent decisions** — observe → relationships → structured memory → semantic memory (ChromaDB) → DeepAgent SDK decision → validate action
 3. **Action resolution** — `trade`, `talk`, `campaign`, `vote`, `gift`, `steal`, `sabotage`, `build`, `quarry`, `persuade`
 4. **Elections** — start or advance ballots; finalize winner and assign chief
 5. **Economy** — production, consumption, scarcity, reputation decay; threat level from resource strain
@@ -343,7 +343,7 @@ Typed exceptions in `exceptions.py` replace silent fallbacks:
 ## Hard Constraints
 
 - Simulation engine owns state truth
-- LangGraph only produces actions
+- DeepAgent SDK only produces actions
 - LLM cannot mutate world state directly
 - SQLite is the source of truth
 - ChromaDB is only for semantic retrieval; SQLite holds authoritative memory rows

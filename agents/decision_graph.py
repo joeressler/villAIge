@@ -4,9 +4,8 @@ import json
 import logging
 from typing import Any, TypedDict
 
-logger = logging.getLogger(__name__)
-
-from langgraph.graph import END, StateGraph
+from deepagents import create_deep_agent
+from langchain_core.messages import AIMessage, HumanMessage
 
 from agents.agent import AgentRunner
 from agents.llm_schemas import LLMActionProposal
@@ -21,15 +20,19 @@ from agents.prompts import (
 )
 from agents.relationships import RelationshipManager
 from agents.roster_utils import default_talk_action, other_agents
+from agents.village_harness import register_village_harness
 from config import AppConfig
 from db.repository import Repository
 from exceptions import InvalidActionError, LLMParseError
+from llm.langchain_utils import message_to_llm_response
 from llm.provider import LLMResponse, LLMResponsePath
 from llm.router import LLMRouter
 from models.schemas import VALID_ACTIONS, Action, Agent, WorldState
 from observability.langfuse_tracer import LangfuseTracer
 from observability.tick_profiler import get_profiler
 from simulation_core.economy import Economy, ResourceBalance
+
+logger = logging.getLogger(__name__)
 
 
 class AgentState(TypedDict):
@@ -48,6 +51,8 @@ class AgentState(TypedDict):
 
 
 class DecisionGraph:
+    """Village decision pipeline powered by the LangChain DeepAgent SDK."""
+
     def __init__(
         self,
         repo: Repository,
@@ -67,29 +72,51 @@ class DecisionGraph:
         self.agent_runner = agent_runner
         self.config = config
         self.economy = economy or Economy(config)
-        self.graph = self._build_graph()
+        self._model_key = f"{config.llm.default_provider}:{config.llm.default_model}"
+        register_village_harness(self._model_key)
+        self.agent = self._build_agent()
 
-    def _build_graph(self):
-        graph = StateGraph(AgentState)
-        graph.add_node("observe", self._observe)
-        graph.add_node("fetch_relationships", self._fetch_relationships)
-        graph.add_node("fetch_structured_memory", self._fetch_structured_memory)
-        graph.add_node("fetch_semantic_memory", self._fetch_semantic_memory)
-        graph.add_node("synthesize_context", self._synthesize_context)
-        graph.add_node("llm_decision", self._llm_decision)
+    def _build_agent(self):
+        model = self._build_chat_model()
+        return create_deep_agent(
+            model=model,
+            system_prompt=(
+                "Decide the villager's next action from the simulation context. "
+                "Return exactly one valid action."
+            ),
+            response_format=LLMActionProposal,
+        )
 
-        graph.set_entry_point("observe")
-        graph.add_edge("observe", "fetch_relationships")
-        graph.add_edge("fetch_relationships", "fetch_structured_memory")
-        graph.add_edge("fetch_structured_memory", "fetch_semantic_memory")
-        graph.add_edge("fetch_semantic_memory", "synthesize_context")
-        graph.add_edge("synthesize_context", "llm_decision")
-        graph.add_edge("llm_decision", END)
-        return graph.compile()
+    def _build_chat_model(self):
+        llm = self.config.llm
+        timeout = (
+            llm.reasoning_request_timeout_seconds
+            if llm.reasoning_enabled
+            else llm.request_timeout_seconds
+        )
+        if llm.default_provider == "ollama":
+            from langchain_ollama import ChatOllama
+
+            return ChatOllama(
+                base_url=llm.ollama_base_url,
+                model=llm.default_model,
+                temperature=llm.temperature,
+                reasoning=llm.ollama_think if llm.reasoning_enabled else False,
+                client_kwargs={"timeout": timeout},
+            )
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            api_key=llm.openai_api_key,
+            base_url=llm.openai_base_url,
+            model=llm.default_model,
+            temperature=llm.temperature,
+            timeout=timeout,
+        )
 
     def run(self, agent: Agent, world: WorldState) -> Action:
         agents = self.repo.get_all_agents()
-        initial: AgentState = {
+        state: AgentState = {
             "agent": agent,
             "world": world,
             "agents": agents,
@@ -103,8 +130,12 @@ class DecisionGraph:
             "prompt_context": self._empty_prompt_context(),
             "response_path": "freeform",
         }
+        state.update(self._fetch_relationships(state))
+        state.update(self._fetch_structured_memory(state))
+        state.update(self._fetch_semantic_memory(state))
+        state.update(self._synthesize_context(state))
 
-        def invoke_graph(handler) -> dict:
+        def invoke_agent(handler) -> dict:
             config: dict = {}
             if handler is not None:
                 config["callbacks"] = [handler]
@@ -113,15 +144,50 @@ class DecisionGraph:
                     "langfuse_user_id": agent.id,
                     "langfuse_tags": ["village-sim", agent.role],
                 }
-            return self.graph.invoke(initial, config=config)
+            return self._invoke_decision_agent(state, config)
 
-        graph_result = self.tracer.run_agent_decision(agent, world, invoke_graph)
+        graph_result = self.tracer.run_agent_decision(agent, world, invoke_agent)
         action_data = graph_result.get("action")
         if not action_data or not action_data.get("type"):
             raise InvalidActionError(
-                f"Decision graph produced no valid action for agent {agent.id}"
+                f"Decision agent produced no valid action for agent {agent.id}"
             )
         return Action.model_validate(action_data)
+
+    def _invoke_decision_agent(self, state: AgentState, invoke_config: dict) -> dict:
+        agent = state["agent"]
+        world = state["world"]
+        agents = state["agents"]
+        base_prompt = state["prompt"]
+        prompt_context = state.get("prompt_context") or self._empty_prompt_context()
+
+        (
+            response,
+            thinking,
+            action,
+            adjustments,
+            response_path,
+            winning_attempt,
+        ) = self._run_decision_attempts(
+            agent=agent,
+            world=world,
+            agents=agents,
+            base_prompt=base_prompt,
+            prompt_context=prompt_context,
+            invoke_config=invoke_config,
+        )
+
+        return self._record_decision_outcome(
+            agent=agent,
+            world=world,
+            base_prompt=base_prompt,
+            response=response,
+            thinking=thinking,
+            action=action,
+            adjustments=adjustments,
+            response_path=response_path,
+            winning_attempt=winning_attempt,
+        )
 
     @staticmethod
     def _empty_prompt_context() -> DecisionPromptContext:
@@ -155,9 +221,6 @@ class DecisionGraph:
             semantic_memories_json="[]",
             action_schema_block="",
         )
-
-    def _observe(self, state: AgentState) -> dict:
-        return {}
 
     def _fetch_relationships(self, state: AgentState) -> dict:
         agent = state["agent"]
@@ -617,56 +680,91 @@ class DecisionGraph:
         )
         return normalized.action, normalized.adjustments
 
-    def _invoke_llm_attempt(
+    def _response_from_agent_result(
+        self,
+        result: dict[str, Any],
+        *,
+        model_name: str,
+        elapsed_ms: float,
+    ) -> LLMResponse:
+        messages = result.get("messages") or []
+        ai_message = next(
+            (message for message in reversed(messages) if isinstance(message, AIMessage)),
+            None,
+        )
+        if ai_message is not None:
+            return message_to_llm_response(
+                ai_message,
+                model=model_name,
+                latency_ms=elapsed_ms,
+            )
+        structured = result.get("structured_response")
+        text = structured.model_dump_json() if structured is not None else ""
+        return LLMResponse(text=text, latency_ms=elapsed_ms, model=model_name)
+
+    def _invoke_deep_agent_attempt(
         self,
         prompt: str,
         agent: Agent,
         agents: list[Agent],
         *,
         tick: int,
+        invoke_config: dict,
     ) -> tuple[LLMResponse, str, Action | None, list[str], Exception | None, LLMResponsePath]:
         thinking = ""
         parse_error: Exception | None = None
-        used_structured_attempt = False
         forbidden_gift_targets = self._forbidden_gift_targets(agent.id, tick)
+        model_name = self.config.llm.default_model
+        response_path: LLMResponsePath = "structured"
 
-        if self.config.llm.structured_output_enabled:
-            used_structured_attempt = True
-            with get_profiler().agent_phase(agent.id, "llm_structured"):
+        with get_profiler().agent_phase(agent.id, "llm"):
+            import time
+
+            start = time.perf_counter()
+            try:
+                result = self.agent.invoke(
+                    {"messages": [HumanMessage(content=prompt)]},
+                    config=invoke_config,
+                )
+            except Exception as error:
+                if self.config.llm.structured_output_enabled:
+                    self.tracer.trace_structured_fallback(
+                        agent_id=agent.id,
+                        tick=tick,
+                        message=str(error),
+                    )
+                raise
+            elapsed = (time.perf_counter() - start) * 1000
+
+        response = self._response_from_agent_result(
+            result,
+            model_name=model_name,
+            elapsed_ms=elapsed,
+        )
+        thinking = response.thinking or AgentRunner.extract_inline_thinking(response.text)
+
+        structured = result.get("structured_response")
+        if isinstance(structured, LLMActionProposal):
+            with get_profiler().agent_phase(agent.id, "parse"):
                 try:
-                    structured = self.llm_router.generate_structured(
-                        prompt, LLMActionProposal
-                    )
-                    response = structured.response
-                    thinking = response.thinking or AgentRunner.extract_inline_thinking(
-                        response.text
-                    )
                     action, adjustments = self._normalize_action_dict(
-                        structured.parsed.model_dump(),
+                        structured.model_dump(),
                         agents,
                         agent.id,
                         forbidden_gift_targets=forbidden_gift_targets,
                     )
                     return response, thinking, action, adjustments, None, "structured"
-                except LLMParseError as error:
-                    parse_error = error
                 except InvalidActionError as error:
                     return response, thinking, None, [], error, "structured"
-                self.tracer.trace_structured_fallback(
-                    agent_id=agent.id,
-                    tick=tick,
-                    message=str(parse_error),
-                )
+                except LLMParseError as error:
+                    parse_error = error
 
-        with get_profiler().agent_phase(agent.id, "llm"):
-            response = self.llm_router.generate(prompt)
-        thinking = response.thinking or AgentRunner.extract_inline_thinking(
-            response.text
-        )
-
-        response_path: LLMResponsePath = (
-            "structured_fallback" if used_structured_attempt else "freeform"
-        )
+        if self.config.llm.structured_output_enabled and parse_error is not None:
+            self.tracer.trace_structured_fallback(
+                agent_id=agent.id,
+                tick=tick,
+                message=str(parse_error),
+            )
 
         with get_profiler().agent_phase(agent.id, "parse"):
             try:
@@ -677,11 +775,15 @@ class DecisionGraph:
                     agent.id,
                     forbidden_gift_targets=forbidden_gift_targets,
                 )
-                return response, thinking, action, adjustments, None, response_path
+                path: LLMResponsePath = (
+                    "structured_fallback" if parse_error is not None else "freeform"
+                )
+                return response, thinking, action, adjustments, None, path
             except (LLMParseError, InvalidActionError) as error:
                 if parse_error is not None and isinstance(error, LLMParseError):
-                    return response, thinking, None, [], parse_error, response_path
-                return response, thinking, None, [], error, response_path
+                    return response, thinking, None, [], parse_error, "structured_fallback"
+                path = "structured_fallback" if parse_error is not None else "freeform"
+                return response, thinking, None, [], error, path
 
     def _run_decision_attempts(
         self,
@@ -691,6 +793,7 @@ class DecisionGraph:
         agents: list[Agent],
         base_prompt: str,
         prompt_context: DecisionPromptContext,
+        invoke_config: dict,
     ) -> tuple[LLMResponse, str, Action, list[str], LLMResponsePath, int]:
         max_attempts = max(1, self.config.llm.max_decision_attempts)
         response: LLMResponse | None = None
@@ -723,7 +826,13 @@ class DecisionGraph:
                 attempt_adjustments,
                 attempt_error,
                 attempt_path,
-            ) = self._invoke_llm_attempt(prompt, agent, agents, tick=world.tick)
+            ) = self._invoke_deep_agent_attempt(
+                prompt,
+                agent,
+                agents,
+                tick=world.tick,
+                invoke_config=invoke_config,
+            )
 
             last_response_text = response.text
             response_path = attempt_path
@@ -794,7 +903,7 @@ class DecisionGraph:
 
         if action is None or response is None:
             raise InvalidActionError(
-                f"Decision graph produced no valid action for agent {agent.id}"
+                f"Decision agent produced no valid action for agent {agent.id}"
             )
         return response, thinking, action, adjustments, response_path, winning_attempt
 
@@ -849,37 +958,3 @@ class DecisionGraph:
             "action": action.model_dump(),
             "response_path": response_path,
         }
-
-    def _llm_decision(self, state: AgentState) -> dict:
-        agent = state["agent"]
-        world = state["world"]
-        agents = state["agents"]
-        base_prompt = state["prompt"]
-        prompt_context = state.get("prompt_context") or self._empty_prompt_context()
-
-        (
-            response,
-            thinking,
-            action,
-            adjustments,
-            response_path,
-            winning_attempt,
-        ) = self._run_decision_attempts(
-            agent=agent,
-            world=world,
-            agents=agents,
-            base_prompt=base_prompt,
-            prompt_context=prompt_context,
-        )
-
-        return self._record_decision_outcome(
-            agent=agent,
-            world=world,
-            base_prompt=base_prompt,
-            response=response,
-            thinking=thinking,
-            action=action,
-            adjustments=adjustments,
-            response_path=response_path,
-            winning_attempt=winning_attempt,
-        )
